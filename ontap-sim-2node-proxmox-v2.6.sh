@@ -2,6 +2,7 @@
 # =============================================================================
 #  ontap-sim-2node-proxmox.sh
 #  NetApp ONTAP Simulator — automatische 2-node cluster deployement op Proxmox
+# After downloading, make the script executable: `chmod +x ontap-sim-2node-proxmox.sh`
 # =============================================================================
 #
 # VERSIE BEHEER
