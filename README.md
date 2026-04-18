@@ -3,6 +3,7 @@ Automated NetApp ONTAP Simulator 2-node cluster deployment on Proxmox VE
 
 This script handles the complete deployment process: unpacking the OVA, importing disks, configuring VMs, and injecting the correct ONTAP license serials — all fully automated.
 
+> After downloading, make the script executable: `chmod +x ontap-sim-2node-proxmox.sh`
 ---
 
 ## What it does
