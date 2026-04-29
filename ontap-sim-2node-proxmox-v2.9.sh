@@ -45,6 +45,14 @@
 #                   guestfish upload to RAW disk works reliably
 # v2.6  17-04-2026  Set fixed ONTAP Simulator license serials:
 #                   node1=4082368-50-7/4082368507, node2=4034389-06-2/4034389062
+# v2.7  28-04-2026  Configurable NUM_NET_PORTS; dynamische poort-toewijzing:
+#                   net0+net1=cluster, rest gelijk verdeeld over
+#                   cifs (ifgroup a0a) / nfs (ifgroup a0b) / iscsi (individueel)
+# v2.8  29-04-2026  SSH_OPTS uitgebreid met StrictHostKeyChecking=accept-new;
+#                   oplossing voor "Host key verification failed" bij eerste
+#                   verbinding naar nodes die nog niet in known_hosts staan
+# v2.9  29-04-2026  CIFS_BRIDGE/CIFS_VLAN_TAG toegevoegd; CIFS-poorten krijgen
+#                   eigen bridge (vmbr0), cluster/nfs/iscsi blijven op DATA_BRIDGE
 # =============================================================================
 #
 # DESCRIPTION
@@ -102,7 +110,7 @@
 # Available settings in the config file:
 #   - Storage: VM_STORAGE, OVA_STORAGE_ID, OVA_DIR, OVA_NAME
 #   - Nodes: TARGET_NODE1, TARGET_NODE2, VMID1, VMID2
-#   - Network: MGMT_BRIDGE, DATA_BRIDGE, MGMT_VLAN_TAG, DATA_VLAN_TAG
+#   - Network: DATA_BRIDGE, DATA_VLAN_TAG, NUM_NET_PORTS
 #   - Hardware: CORES, SOCKETS, MEMORY_MB, CPU_TYPE, NET_MODEL
 #   - ONTAP: NODE1_SYS_SERIAL_NUM, NODE1_SYSID, NODE2_SYS_SERIAL_NUM, NODE2_SYSID
 #   - Runtime: WORKDIR, EXPECT_TIMEOUT, DISK_FORMAT
@@ -208,10 +216,11 @@ VMID1="${VMID1:-auto}"
 VMID2="${VMID2:-auto}"
 TARGET_NODE1="${TARGET_NODE1:-pve01}"
 TARGET_NODE2="${TARGET_NODE2:-pve02}"
-MGMT_BRIDGE="${MGMT_BRIDGE:-vmbr0}"
 DATA_BRIDGE="${DATA_BRIDGE:-vmbr1}"
-MGMT_VLAN_TAG="${MGMT_VLAN_TAG:-0}"
 DATA_VLAN_TAG="${DATA_VLAN_TAG:-20}"
+CIFS_BRIDGE="${CIFS_BRIDGE:-vmbr0}"
+CIFS_VLAN_TAG="${CIFS_VLAN_TAG:-0}"
+NUM_NET_PORTS="${NUM_NET_PORTS:-8}"
 CORES="${CORES:-2}"
 SOCKETS="${SOCKETS:-1}"
 MEMORY_MB="${MEMORY_MB:-6144}"
@@ -225,7 +234,7 @@ NODE2_SYS_SERIAL_NUM="${NODE2_SYS_SERIAL_NUM:-4034389-06-2}"
 NODE2_SYSID="${NODE2_SYSID:-4034389062}"
 WORKDIR="${WORKDIR:-/var/tmp/ontap-sim-9.16.1}"
 EXPECT_TIMEOUT="${EXPECT_TIMEOUT:-360}"
-SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=5}"
+SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new}"
 DISK_FORMAT="${DISK_FORMAT:-raw}"
 
 # Initialize VM names (will be set in alloc_vmids())
@@ -238,7 +247,7 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "ERROR: required command missing: $1" >&2; exit 1; }
 }
 
-for cmd in qm tar awk sed grep find socat timeout pvesh pvesm hostname ssh; do
+for cmd in qm tar awk sed grep find timeout pvesh pvesm hostname ssh python3; do
   require_cmd "$cmd"
 done
 
@@ -472,15 +481,36 @@ check_storage_reachable_for_node() {
 check_ova_path_reachable_for_node() {
   local node="$1"
   local path="$2"
-  local short_host long_host node_lower
-  short_host="$(hostname -s 2>/dev/null || true)"
-  long_host="$(hostname 2>/dev/null || true)"
-  node_lower="${node,,}"
-  if [[ "${node_lower}" == "${short_host,,}" || "${node_lower}" == "${long_host,,}" ]]; then
-    test -r "$path"
-  else
-    ssh $SSH_OPTS "$node" "test -r '$path'" >/dev/null 2>&1
+  local ova_file
+  ova_file="$(basename "$path")"
+
+  # Primaire methode: Proxmox storage-content API — werkt via cluster-proxy,
+  # geen SSH-sleutels nodig tussen uitvoerende node en target.
+  if pvesh get "/nodes/${node}/storage/${OVA_STORAGE_ID}/content" \
+       --output-format json 2>/dev/null \
+     | python3 -c "
+import sys, json
+try:
+    items = json.load(sys.stdin)
+    for item in items:
+        if item.get('volid','').endswith('/${ova_file}'):
+            sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+    return 0
   fi
+
+  # Fallback: directe bestandscheck via run_on_node (zelfde SSH-pad als rest van script)
+  local err
+  if err=$(run_on_node "$node" test -r "$path" 2>&1); then
+    return 0
+  fi
+  echo "  [OVA check] API check én SSH check mislukt op $node." >&2
+  echo "  SSH-fout: ${err:-geen foutmelding}" >&2
+  echo "  Controleer: ssh $node test -r '$path'" >&2
+  return 1
 }
 
 validate_node_access() {
@@ -565,6 +595,74 @@ format_nic() {
   else
     echo "$NET_MODEL,bridge=$bridge,tag=$tag"
   fi
+}
+
+validate_num_ports() {
+  if ! [[ "$NUM_NET_PORTS" =~ ^[0-9]+$ ]] || (( NUM_NET_PORTS < 4 )); then
+    echo "ERROR: NUM_NET_PORTS moet een geheel getal >= 4 zijn (waarde: '$NUM_NET_PORTS')" >&2
+    exit 1
+  fi
+  local remaining=$(( NUM_NET_PORTS - 2 ))
+  if (( remaining % 3 != 0 )); then
+    echo "ERROR: NUM_NET_PORTS=$NUM_NET_PORTS is ongeldig." >&2
+    echo "  Na 2 cluster-poorten moeten de resterende $remaining poort(en)" >&2
+    echo "  deelbaar zijn door 3 (gelijke verdeling: cifs / nfs / iscsi)." >&2
+    echo "  Geldige waarden: 5, 8, 11, 14, ..." >&2
+    exit 1
+  fi
+}
+
+# Print ONTAP port-mapping en ifgroup-commando's voor na de cluster-setup.
+print_port_info() {
+  local ports_per_proto=$(( (NUM_NET_PORTS - 2) / 3 ))
+  local letters="abcdefghijklmnopqrstuvwxyz"
+  local i netid
+
+  echo ""
+  echo "Netwerk poort-mapping (per ONTAP node, ${NUM_NET_PORTS} poorten):"
+  printf "  %-7s  %-5s  %-22s  %s\n" "Proxmox" "ONTAP" "Doel" "Bridge"
+  printf "  %-7s  %-5s  %-22s  %s\n" "-------" "-----" "----" "------"
+  for (( i=0; i<2; i++ )); do
+    printf "  net%-4d e0%-4s %-22s  %s vlan %s\n" \
+      "$i" "${letters:$i:1}" "cluster interconnect" "$DATA_BRIDGE" "$DATA_VLAN_TAG"
+  done
+  for (( i=0; i<ports_per_proto; i++ )); do
+    netid=$(( 2 + i ))
+    printf "  net%-4d e0%-4s %-22s  %s vlan %s\n" \
+      "$netid" "${letters:$netid:1}" "cifs  (ifgroup a0a)" "$CIFS_BRIDGE" "$CIFS_VLAN_TAG"
+  done
+  for (( i=0; i<ports_per_proto; i++ )); do
+    netid=$(( 2 + ports_per_proto + i ))
+    printf "  net%-4d e0%-4s %-22s  %s vlan %s\n" \
+      "$netid" "${letters:$netid:1}" "nfs   (ifgroup a0b)" "$DATA_BRIDGE" "$DATA_VLAN_TAG"
+  done
+  for (( i=0; i<ports_per_proto; i++ )); do
+    netid=$(( 2 + 2*ports_per_proto + i ))
+    printf "  net%-4d e0%-4s %-22s  %s vlan %s\n" \
+      "$netid" "${letters:$netid:1}" "iscsi (individueel)" "$DATA_BRIDGE" "$DATA_VLAN_TAG"
+  done
+
+  echo ""
+  echo "ONTAP ifgroup-commando's (uitvoeren per node na cluster-init):"
+  echo "  # CIFS ifgroup a0a:"
+  echo "  network port ifgrp create -node <node> -ifgrp a0a -distr-func port -mode multimode_lacp"
+  for (( i=0; i<ports_per_proto; i++ )); do
+    netid=$(( 2 + i ))
+    echo "  network port ifgrp add-port -node <node> -ifgrp a0a -port e0${letters:$netid:1}"
+  done
+  echo ""
+  echo "  # NFS ifgroup a0b:"
+  echo "  network port ifgrp create -node <node> -ifgrp a0b -distr-func port -mode multimode_lacp"
+  for (( i=0; i<ports_per_proto; i++ )); do
+    netid=$(( 2 + ports_per_proto + i ))
+    echo "  network port ifgrp add-port -node <node> -ifgrp a0b -port e0${letters:$netid:1}"
+  done
+  echo ""
+  echo "  # iSCSI poorten (individueel, geen ifgroup):"
+  for (( i=0; i<ports_per_proto; i++ )); do
+    netid=$(( 2 + 2*ports_per_proto + i ))
+    echo "  #   e0${letters:$netid:1}"
+  done
 }
 
 cleanup_vm_and_orphaned_disks() {
@@ -660,15 +758,18 @@ create_vm() {
 
   ensure_machine_type "$vmid" "$target_node"
 
-  echo "[VM $vmid] Add network interfaces on $target_node"
-  run_on_node "$target_node" qm set "$vmid" --net0 "$(format_nic "$DATA_BRIDGE" "$DATA_VLAN_TAG")"
-  run_on_node "$target_node" qm set "$vmid" --net1 "$(format_nic "$DATA_BRIDGE" "$DATA_VLAN_TAG")"
-  run_on_node "$target_node" qm set "$vmid" --net2 "$(format_nic "$MGMT_BRIDGE" "$MGMT_VLAN_TAG")"
-  run_on_node "$target_node" qm set "$vmid" --net3 "$(format_nic "$DATA_BRIDGE" "$DATA_VLAN_TAG")"
-  run_on_node "$target_node" qm set "$vmid" --net4 "$(format_nic "$MGMT_BRIDGE" "$MGMT_VLAN_TAG")"
-  run_on_node "$target_node" qm set "$vmid" --net5 "$(format_nic "$MGMT_BRIDGE" "$MGMT_VLAN_TAG")"
-  run_on_node "$target_node" qm set "$vmid" --net6 "$(format_nic "$DATA_BRIDGE" "$DATA_VLAN_TAG")"
-  run_on_node "$target_node" qm set "$vmid" --net7 "$(format_nic "$DATA_BRIDGE" "$DATA_VLAN_TAG")"
+  echo "[VM $vmid] Add $NUM_NET_PORTS network interfaces on $target_node"
+  local _ports_per_proto=$(( (NUM_NET_PORTS - 2) / 3 ))
+  local _cifs_end=$(( 2 + _ports_per_proto ))
+  for (( _p=0; _p<NUM_NET_PORTS; _p++ )); do
+    if (( _p >= 2 && _p < _cifs_end )); then
+      # cifs-poorten → CIFS_BRIDGE
+      run_on_node "$target_node" qm set "$vmid" "--net${_p}" "$(format_nic "$CIFS_BRIDGE" "$CIFS_VLAN_TAG")"
+    else
+      # cluster (0,1) + nfs + iscsi → DATA_BRIDGE
+      run_on_node "$target_node" qm set "$vmid" "--net${_p}" "$(format_nic "$DATA_BRIDGE" "$DATA_VLAN_TAG")"
+    fi
+  done
 
   # FIX: use a per-VM local array (no global NODE_DISKS anymore)
   local -a node_disks=()
@@ -795,7 +896,7 @@ create_vm() {
   fi
 
   run_on_node "$target_node" qm set "$vmid" --boot order=ide0
-  run_on_node "$target_node" qm set "$vmid" --description "NetApp ONTAP Simulator 9.16.1 two-node lab; net0=$MGMT_BRIDGE net1-3=$DATA_BRIDGE; host=$target_node"
+  run_on_node "$target_node" qm set "$vmid" --description "NetApp ONTAP Simulator 9.16.1 two-node lab; ${NUM_NET_PORTS} ports op ${DATA_BRIDGE} (vlan ${DATA_VLAN_TAG}); host=${target_node}"
 
   echo "[VM $vmid] Final disk/boot config on $target_node:"
   run_on_node "$target_node" qm config "$vmid" | grep -E '^(boot|ide|sata|scsi|serial|vga):' || true
@@ -1047,18 +1148,19 @@ cat <<STARTINFO
   VM_STORAGE       = ${VM_STORAGE}
   VMID1            = ${VMID1}
   VMID2            = ${VMID2}
+  DATA_BRIDGE      = ${DATA_BRIDGE}
+  DATA_VLAN_TAG    = ${DATA_VLAN_TAG}
+  CIFS_BRIDGE      = ${CIFS_BRIDGE}
+  CIFS_VLAN_TAG    = ${CIFS_VLAN_TAG}
+  NUM_NET_PORTS    = ${NUM_NET_PORTS}
 STARTINFO
 
+validate_num_ports
 check_vg_on_all_nodes iscsi-data
 validate_api_access
 
 OVA_DIR_RESOLVED="$OVA_DIR"
 OVA_PATH="$OVA_DIR_RESOLVED/$OVA_NAME"
-
-if [[ ! -r "$OVA_PATH" ]]; then
-  echo "ERROR: OVA not readable at $OVA_PATH" >&2
-  exit 1
-fi
 
 validate_node_access
 alloc_vmids
@@ -1105,3 +1207,5 @@ cat <<POST
    - Join node2 via cluster-interconnect network
 
 POST
+
+print_port_info
