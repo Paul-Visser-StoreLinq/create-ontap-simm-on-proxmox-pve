@@ -186,18 +186,21 @@ The capacity of the sim disk is read from the OVA itself, so nothing has to be l
 ./ontap-sim-2node-proxmox.sh --show-sim-disk      # on a Proxmox host
 ```
 
-It extracts the OVA on `TARGET_NODE1` (with the same free-space check as a deploy) or reuses an existing `extracted-<node>` directory, reads the virtual size of the sim disk (4th VMDK) with `qemu-img info`, and prints for every known disk type the size per disk and the maximum number of disks that fit (including `SIM_DISK_MARGIN_PCT`), spread over shelves (max 14 per shelf, max 4 shelves). Example (a 250 GB sim disk; the real size comes from your OVA):
+It extracts the OVA on `TARGET_NODE1` (with the same free-space check as a deploy) or reuses an existing `extracted-<node>` directory, reads the virtual size of the sim disk (4th VMDK) with `qemu-img info`, and prints for every known disk type the size per disk and the layout the config can actually do: `SIM_SHELVES` shelves (default 2) with the **same** number of disks on each shelf (max 14), including `SIM_DISK_MARGIN_PCT`. Behind it, in parentheses, the theoretical maximum number of disks that fit in total (max 56). Example (a 250 GB sim disk; the real size comes from your OVA):
 
 ```
 Sim disk (4th OVA disk, ide3): 250 GB virtual; usable with 10% margin: 227 GB
-  Type   GB/disk  Max disks  Layout (max 14 per shelf, max 4 shelves)
-  23     1        56         4 x 14
-  31     4        56         4 x 14
-  36     9        25         1 x 14 + 1 x 11  <- SIM_DISK_TYPE
+Layout = 2 shelves (SIM_SHELVES) with an equal number of disks per shelf (max 14); (max N) = most disks that fit in total (max 56).
+  Type   GB/disk  Layout
+  23     1        2 x 14 = 28 disks  (max 56)
+  31     4        2 x 14 = 28 disks  (max 56)
+  36     9        2 x 12 = 24 disks  (max 25)  <- SIM_DISK_TYPE
 
 Current config: type 36 (~9 GB) x 14 per shelf x 2 shelves = 28 disks, vdevinit=36:14:0,36:14:1
   DOES NOT FIT: needs 277 GB incl. 10% margin, sim disk is 250 GB (maximum: 25 disks of type 36)
 ```
+
+The config only supports an equal number of disks per shelf, so the table shows the same choice `SIM_DISKS_PER_SHELF="auto"` makes (here `2 x 12 = 24`, not the unequal `14 + 11`). The `(max N)` can be higher than the product when the total does not divide evenly over the shelves, or when more shelves would be needed (try `SIM_SHELVES=4`). `does not fit` means not even 1 disk per shelf fits with that many shelves.
 
 It also says whether the current `SIM_DISK_TYPE` / `SIM_DISKS_PER_SHELF` / `SIM_SHELVES` fit. No VM is created and nothing on Proxmox is changed. The extracted directory is removed afterwards unless `KEEP_EXTRACTED=1`; an already existing directory is reused and left in place. `--show-ports` stays a quick plan without extracting and points to this option.
 
@@ -285,6 +288,7 @@ Then follow the standard ONTAP cluster setup wizard on node1 and join node2 via 
 | v3.1.1 | 08-10-2026 | Fix: environment variables now really override the config file (they were ignored for every variable the config assigns) |
 | v3.1.2 | 08-10-2026 | Free-space check on `WORKDIR` per host before extracting; OVA extracted once when both nodes share a host; extracted directories removed after a successful run (`KEEP_EXTRACTED`) |
 | v3.2 | 08-10-2026 | `--show-sim-disk` (capacity of the sim disk per disk type, no VM created); `SIM_DISKS_PER_SHELF="auto"` |
+| v3.2.1 | 08-10-2026 | `--show-sim-disk` table shows the equal-per-shelf layout the config can do (e.g. `2 x 12 = 24`, with `(max 25)`), consistent with `auto` |
 
 ---
 

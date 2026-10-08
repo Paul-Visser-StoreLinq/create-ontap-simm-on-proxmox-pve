@@ -98,6 +98,12 @@
 #                   chosen value is shown in the settings summary. --show-ports
 #                   points to --show-sim-disk. Needed capacity is now rounded
 #                   up so the check and the maximum never disagree.
+# v3.2.1 08-10-2026 --show-sim-disk table shows the layout the config can do:
+#                   SIM_SHELVES shelves with an EQUAL number of disks per shelf
+#                   (e.g. "2 x 12 = 24"), the same choice SIM_DISKS_PER_SHELF=auto
+#                   makes, with the theoretical maximum behind it "(max 25)".
+#                   Was an unequal layout such as "1 x 14 + 1 x 11" that the
+#                   config cannot express.
 # =============================================================================
 #
 # DESCRIPTION
@@ -213,7 +219,7 @@ set -euo pipefail
 
 # Single source of truth for the script version. Update together with the
 # VERSION HISTORY above, README and CHANGELOG.
-SCRIPT_VERSION="3.2"
+SCRIPT_VERSION="3.2.1"
 
 # Default config file location
 CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
@@ -423,6 +429,16 @@ sim_max_disks() {
   local avail_mb="$1" gb="$2" n
   n=$(( avail_mb * 100 / (100 + SIM_DISK_MARGIN_PCT) / (gb * 1024) ))
   if (( n > SIM_MAX_DISKS )); then n=$SIM_MAX_DISKS; fi
+  echo "$n"
+}
+
+# The config only supports an EQUAL number of disks on every shelf. Highest such
+# number (max 14) for <shelves> shelves when <max_disks> disks fit in total.
+# Shared by SIM_DISKS_PER_SHELF=auto and the --show-sim-disk table.
+sim_per_shelf() {
+  local max_disks="$1" shelves="$2" n
+  n=$(( max_disks / shelves ))
+  if (( n > 14 )); then n=14; fi
   echo "$n"
 }
 
@@ -1184,8 +1200,7 @@ sim_resolve_layout() {
   (( SIM_PER_SHELF_AUTO == 1 )) || return 0
   local max_disks chosen
   max_disks=$(sim_max_disks "$SIM_DISK_AVAIL_MB" "$SIM_DISK_GB")
-  chosen=$(( max_disks / SIM_SHELVES ))
-  if (( chosen > 14 )); then chosen=14; fi
+  chosen=$(sim_per_shelf "$max_disks" "$SIM_SHELVES")
   if (( chosen < 1 )); then
     chosen=1
     SIM_AUTO_NOTE="auto: not even 1 disk per shelf fits (using 1 to report the shortfall)"
@@ -1232,26 +1247,36 @@ check_sim_disk_capacity() {
 # --show-sim-disk: capacity of the sim disk per disk type, without creating a VM.
 print_sim_disk_table() {
   local usable_mb=$(( SIM_DISK_AVAIL_MB * 100 / (100 + SIM_DISK_MARGIN_PCT) ))
-  local t gb max full rem layout mark
+  local t gb max per layout mark shelves
   local -a types=()
   mapfile -t types < <(printf '%s\n' "${!SIM_TYPE_GB[@]}" | sort -n)
   if (( SIM_ENABLED == 1 )) && [[ -z "${SIM_TYPE_GB[$SIM_DISK_TYPE]:-}" ]]; then
     types+=("$SIM_DISK_TYPE")   # type outside the table, size from SIM_DISK_SIZE_GB
   fi
 
+  # The layout shown is what the config can actually do: SIM_SHELVES shelves with
+  # the SAME number of disks on each (the same choice SIM_DISKS_PER_SHELF=auto makes).
+  # SIM_SHELVES not set (or invalid) while SIM_DISK_TYPE is unset: the default 2.
+  shelves="${SIM_SHELVES:-2}"
+  if ! [[ "$shelves" =~ ^[0-9]+$ ]] || (( 10#$shelves < 1 || 10#$shelves > 4 )); then shelves=2; fi
+  shelves=$((10#$shelves))
+
   echo ""
   echo "Sim disk (4th OVA disk, ide3): $(( SIM_DISK_AVAIL_MB / 1024 )) GB virtual; usable with ${SIM_DISK_MARGIN_PCT}% margin: $(( usable_mb / 1024 )) GB"
-  printf '  %-6s %-8s %-10s %s\n' "Type" "GB/disk" "Max disks" "Layout (max 14 per shelf, max 4 shelves)"
+  echo "Layout = ${shelves} shelves (SIM_SHELVES) with an equal number of disks per shelf (max 14); (max N) = most disks that fit in total (max 56)."
+  printf '  %-6s %-8s %s\n' "Type" "GB/disk" "Layout"
   for t in "${types[@]}"; do
     gb="${SIM_TYPE_GB[$t]:-0}"
     mark=""
     if (( SIM_ENABLED == 1 )) && [[ "$t" == "$SIM_DISK_TYPE" ]]; then gb="$SIM_DISK_GB"; mark="  <- SIM_DISK_TYPE"; fi
     max=$(sim_max_disks "$SIM_DISK_AVAIL_MB" "$gb")
-    full=$(( max / 14 )); rem=$(( max % 14 )); layout=""
-    if (( full > 0 )); then layout="${full} x 14"; fi
-    if (( rem > 0 )); then layout="${layout:+$layout + }1 x ${rem}"; fi
-    [[ -z "$layout" ]] && layout="does not fit"
-    printf '  %-6s %-8s %-10s %s%s\n' "$t" "$gb" "$max" "$layout" "$mark"
+    per=$(sim_per_shelf "$max" "$shelves")
+    if (( per >= 1 )); then
+      layout="${shelves} x ${per} = $(( shelves * per )) disks  (max ${max})"
+    else
+      layout="does not fit  (max ${max})"
+    fi
+    printf '  %-6s %-8s %s%s\n' "$t" "$gb" "$layout" "$mark"
   done
 }
 

@@ -5,6 +5,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.2.1] – 2026-10-08
+
+### Changed
+- **`--show-sim-disk` table shows a layout the config can actually do.** v3.2 printed the theoretical distribution over shelves (e.g. `1 x 14 + 1 x 11` = 25), but the config only supports an *equal* number of disks per shelf, and `SIM_DISKS_PER_SHELF="auto"` then picks `2 x 12 = 24`. The table now shows, per type, `SIM_SHELVES` shelves (default 2 when unset) with one equal number per shelf, e.g. `2 x 12 = 24 disks  (max 25)`, with the theoretical maximum in parentheses behind it. `does not fit` is shown when not even 1 disk per shelf fits. The separate "Max disks" column is gone (the maximum now sits behind the layout).
+- The "equal number per shelf" rule is one function, `sim_per_shelf()`, used by both `auto` and the table, so they cannot disagree.
+- An existing `extracted-<node>` directory that `--show-sim-disk` reuses is still left in place, as before.
+
+---
+
 ## [v3.2] – 2026-10-08
 
 Backwards compatible: without the new option and value the behaviour is unchanged.
