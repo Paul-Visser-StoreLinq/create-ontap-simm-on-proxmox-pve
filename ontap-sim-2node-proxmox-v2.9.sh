@@ -247,6 +247,41 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "ERROR: required command missing: $1" >&2; exit 1; }
 }
 
+# This script drives the Proxmox tooling (qm/pvesh/pvesm) directly, so it has to
+# run ON a Proxmox VE node — not from a workstation/laptop. Say so explicitly,
+# otherwise the first missing command below looks like an unrelated error.
+require_proxmox_host() {
+  local missing=()
+  local cmd
+  for cmd in qm pvesh pvesm; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  [ ${#missing[@]} -eq 0 ] && return 0
+
+  cat >&2 <<EOF
+ERROR: this script must be run ON a Proxmox VE host.
+
+  Missing Proxmox command(s): ${missing[*]}
+  Current host: $(hostname 2>/dev/null || echo unknown) ($(uname -s 2>/dev/null || echo unknown))
+
+  The script calls qm/pvesh/pvesm directly and reaches the other nodes over SSH,
+  so it cannot run from a workstation, laptop or macOS/WSL shell.
+
+  Copy the script and its config to one of your Proxmox nodes and run it there:
+
+    scp $(basename "$0") <config.conf> root@<pve-node>:/root/
+    ssh root@<pve-node>
+    chmod +x /root/$(basename "$0")
+    /root/$(basename "$0") --config /root/<config.conf>
+
+  Note: paths in the config (such as the OVA location) must be valid as seen
+  from the Proxmox node, not from your workstation.
+EOF
+  exit 1
+}
+
+require_proxmox_host
+
 for cmd in qm tar awk sed grep find timeout pvesh pvesm hostname ssh python3; do
   require_cmd "$cmd"
 done
