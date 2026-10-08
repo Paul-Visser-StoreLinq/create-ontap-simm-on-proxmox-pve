@@ -89,6 +89,15 @@
 #                   KEEP_EXTRACTED=1 keeps them, and nothing is removed after
 #                   an error (so there is something to debug). Removal only
 #                   touches paths below WORKDIR.
+# v3.2  08-10-2026  --show-sim-disk: extracts the OVA on TARGET_NODE1 (or reuses
+#                   an extracted dir), reads the sim disk size and prints, per
+#                   known disk type, the maximum number of disks and the shelf
+#                   layout, plus whether the current SIM_* config fits. No VM
+#                   is created. SIM_DISKS_PER_SHELF=auto picks the highest
+#                   number per shelf (max 14) that fits the sim disk; the
+#                   chosen value is shown in the settings summary. --show-ports
+#                   points to --show-sim-disk. Needed capacity is now rounded
+#                   up so the check and the maximum never disagree.
 # =============================================================================
 #
 # DESCRIPTION
@@ -136,6 +145,12 @@
 #
 #   Start VMs directly after creation:
 #     START_AFTER_CREATE=1 ./ontap-sim-2node-proxmox.sh
+#
+#   How many simulated disks fit in the OVA's sim disk (no VM is created):
+#     ./ontap-sim-2node-proxmox.sh --show-sim-disk
+#
+#   Let the script pick the number of disks per shelf (SIM_DISK_TYPE=36 etc.):
+#     SIM_DISK_TYPE=36 SIM_DISKS_PER_SHELF=auto ./ontap-sim-2node-proxmox.sh
 #
 # CONFIGURATION FILE
 # ------------------
@@ -198,12 +213,13 @@ set -euo pipefail
 
 # Single source of truth for the script version. Update together with the
 # VERSION HISTORY above, README and CHANGELOG.
-SCRIPT_VERSION="3.1.2"
+SCRIPT_VERSION="3.2"
 
 # Default config file location
 CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
 
 SHOW_PORTS=0
+SHOW_SIM_DISK=0
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -220,6 +236,10 @@ while [[ $# -gt 0 ]]; do
       SHOW_PORTS=1
       shift
       ;;
+    --show-sim-disk)
+      SHOW_SIM_DISK=1
+      shift
+      ;;
     --help|-h)
       cat <<HELP
 $(basename "$0") v${SCRIPT_VERSION}
@@ -230,6 +250,11 @@ Options:
                    Default: ./ontap-sim-2node-proxmox.conf
   --show-ports     Validate the network config, print the port mapping
                    (bridge/VLAN per port) and exit; changes nothing
+  --show-sim-disk  Extract the OVA on TARGET_NODE1 (or reuse an extracted
+                   directory), read the size of the sim disk and print per
+                   disk type how many simulated disks fit, plus whether the
+                   current SIM_* config fits. Needs a Proxmox host; creates
+                   no VM. Removes what it extracted unless KEEP_EXTRACTED=1
   --version        Show script version
   --help           Show this help message
 
@@ -253,6 +278,11 @@ HELP
       ;;
   esac
 done
+
+if (( SHOW_PORTS == 1 && SHOW_SIM_DISK == 1 )); then
+  echo "ERROR: use either --show-ports or --show-sim-disk, not both" >&2
+  exit 1
+fi
 
 # Verify config file exists
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -365,35 +395,79 @@ validate_network_config
 # disks"): 23 = default 1 GB disk, 31 = 4 GB, 36 = 9 GB. Verify with
 # `vsim_makedisks -h` on the simulator. Other types need SIM_DISK_SIZE_GB.
 declare -A SIM_TYPE_GB=( [23]=1 [31]=4 [36]=9 )
-SIM_VDEVINIT=""      # value for bootarg.(vm.)sim.vdevinit; empty = feature off
-SIM_DISK_GB=0        # nominal GB per simulated disk
-SIM_NEEDED_MB=0      # disks x size + margin
+SIM_ENABLED=0          # 1 when SIM_DISK_TYPE is set
+SIM_PER_SHELF_AUTO=0   # 1 when SIM_DISKS_PER_SHELF=auto (resolved once the sim disk size is known)
+SIM_AUTO_NOTE=""       # what auto chose, for the log
+SIM_VDEVINIT=""        # value for bootarg.(vm.)sim.vdevinit; empty until the layout is known
+SIM_DISK_GB=0          # nominal GB per simulated disk
+SIM_NEEDED_MB=0        # disks x size + margin
+SIM_DISK_AVAIL_MB=0    # virtual size of the sim disk (filled by read_sim_disk_size)
+SIM_MAX_DISKS=56       # hard limit: 4 shelves x 14 disks
+
+# Build vdevinit and the needed capacity from the current SIM_* values.
+# Format: <type>:<disks>:<shelf>,... one entry per shelf (shelf numbers from 0).
+sim_build_layout() {
+  local shelf entries=() disks
+  for (( shelf=0; shelf<SIM_SHELVES; shelf++ )); do
+    entries+=("${SIM_DISK_TYPE}:${SIM_DISKS_PER_SHELF}:${shelf}")
+  done
+  SIM_VDEVINIT="$(IFS=,; echo "${entries[*]}")"
+  disks=$(( SIM_SHELVES * SIM_DISKS_PER_SHELF ))
+  # Round UP, so "needed <= available" and "disks <= sim_max_disks" never disagree
+  SIM_NEEDED_MB=$(( (disks * SIM_DISK_GB * 1024 * (100 + SIM_DISK_MARGIN_PCT) + 99) / 100 ))
+}
+
+# Maximum number of disks of <gb> GB that fit in <avail_mb> including the margin
+# (capped at 56). Used by the capacity check, auto and --show-sim-disk.
+sim_max_disks() {
+  local avail_mb="$1" gb="$2" n
+  n=$(( avail_mb * 100 / (100 + SIM_DISK_MARGIN_PCT) / (gb * 1024) ))
+  if (( n > SIM_MAX_DISKS )); then n=$SIM_MAX_DISKS; fi
+  echo "$n"
+}
 
 # Runs before anything touches Proxmox. Unset SIM_DISK_TYPE = nothing changes.
 validate_sim_disk_config() {
-  [[ -z "$SIM_DISK_TYPE" ]] && return 0
-
   local var
+  SIM_DISK_MARGIN_PCT="${SIM_DISK_MARGIN_PCT:-10}"
+  if ! [[ "$SIM_DISK_MARGIN_PCT" =~ ^[0-9]+$ ]] || (( 10#$SIM_DISK_MARGIN_PCT > 100 )); then
+    echo "ERROR: SIM_DISK_MARGIN_PCT must be 0-100 (value: '$SIM_DISK_MARGIN_PCT')" >&2
+    exit 1
+  fi
+  SIM_DISK_MARGIN_PCT=$((10#$SIM_DISK_MARGIN_PCT))
+
+  [[ -z "$SIM_DISK_TYPE" ]] && return 0
+  SIM_ENABLED=1
+
   SIM_DISKS_PER_SHELF="${SIM_DISKS_PER_SHELF:-14}"
   SIM_SHELVES="${SIM_SHELVES:-2}"
-  SIM_DISK_MARGIN_PCT="${SIM_DISK_MARGIN_PCT:-10}"
 
-  for var in SIM_DISK_TYPE SIM_DISKS_PER_SHELF SIM_SHELVES SIM_DISK_MARGIN_PCT; do
+  # "auto": the highest number of disks per shelf (max 14) that fits the sim disk
+  # with SIM_SHELVES and SIM_DISK_TYPE. Needs the sim disk size, so it is resolved
+  # after the OVA has been extracted (sim_resolve_layout).
+  if [[ "${SIM_DISKS_PER_SHELF,,}" == "auto" ]]; then
+    SIM_PER_SHELF_AUTO=1
+    SIM_DISKS_PER_SHELF="auto"
+  fi
+
+  for var in SIM_DISK_TYPE SIM_SHELVES; do
     if ! [[ "${!var}" =~ ^[0-9]+$ ]]; then
       echo "ERROR: $var must be a whole number (value: '${!var}')" >&2
       exit 1
     fi
   done
-  if (( 10#$SIM_DISKS_PER_SHELF < 1 || 10#$SIM_DISKS_PER_SHELF > 14 )); then
-    echo "ERROR: SIM_DISKS_PER_SHELF must be 1-14 (value: '$SIM_DISKS_PER_SHELF')" >&2
-    exit 1
+  if (( SIM_PER_SHELF_AUTO == 0 )); then
+    if ! [[ "$SIM_DISKS_PER_SHELF" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: SIM_DISKS_PER_SHELF must be a whole number 1-14 or 'auto' (value: '$SIM_DISKS_PER_SHELF')" >&2
+      exit 1
+    fi
+    if (( 10#$SIM_DISKS_PER_SHELF < 1 || 10#$SIM_DISKS_PER_SHELF > 14 )); then
+      echo "ERROR: SIM_DISKS_PER_SHELF must be 1-14 or 'auto' (value: '$SIM_DISKS_PER_SHELF')" >&2
+      exit 1
+    fi
   fi
   if (( 10#$SIM_SHELVES < 1 || 10#$SIM_SHELVES > 4 )); then
     echo "ERROR: SIM_SHELVES must be 1-4 (value: '$SIM_SHELVES')" >&2
-    exit 1
-  fi
-  if (( 10#$SIM_DISK_MARGIN_PCT > 100 )); then
-    echo "ERROR: SIM_DISK_MARGIN_PCT must be 0-100 (value: '$SIM_DISK_MARGIN_PCT')" >&2
     exit 1
   fi
   if [[ "$AUTOMATE_NODE2_SYSID" != "1" ]]; then
@@ -403,9 +477,8 @@ validate_sim_disk_config() {
 
   # Normalize (strip leading zeros) before use
   SIM_DISK_TYPE=$((10#$SIM_DISK_TYPE))
-  SIM_DISKS_PER_SHELF=$((10#$SIM_DISKS_PER_SHELF))
   SIM_SHELVES=$((10#$SIM_SHELVES))
-  SIM_DISK_MARGIN_PCT=$((10#$SIM_DISK_MARGIN_PCT))
+  if (( SIM_PER_SHELF_AUTO == 0 )); then SIM_DISKS_PER_SHELF=$((10#$SIM_DISKS_PER_SHELF)); fi
 
   if [[ -n "$SIM_DISK_SIZE_GB" ]]; then
     if ! [[ "$SIM_DISK_SIZE_GB" =~ ^[0-9]+$ ]] || (( 10#$SIM_DISK_SIZE_GB < 1 )); then
@@ -423,15 +496,8 @@ validate_sim_disk_config() {
     exit 1
   fi
 
-  # Format: <type>:<disks>:<shelf>,... one entry per shelf (shelf numbers from 0)
-  local shelf entries=()
-  for (( shelf=0; shelf<SIM_SHELVES; shelf++ )); do
-    entries+=("${SIM_DISK_TYPE}:${SIM_DISKS_PER_SHELF}:${shelf}")
-  done
-  SIM_VDEVINIT="$(IFS=,; echo "${entries[*]}")"
-
-  local disks=$(( SIM_SHELVES * SIM_DISKS_PER_SHELF ))
-  SIM_NEEDED_MB=$(( disks * SIM_DISK_GB * 1024 * (100 + SIM_DISK_MARGIN_PCT) / 100 ))
+  # With a fixed number per shelf the layout is known now; with auto it follows later
+  if (( SIM_PER_SHELF_AUTO == 0 )); then sim_build_layout; fi
 }
 
 validate_sim_disk_config
@@ -443,23 +509,30 @@ fi
 
 # One-line description of the sim disk setting (startup summary, VM description)
 sim_disk_summary() {
-  if [[ -z "$SIM_VDEVINIT" ]]; then
+  if (( SIM_ENABLED == 0 )); then
     echo "OVA default"
+  elif [[ -z "$SIM_VDEVINIT" ]]; then
+    echo "type ${SIM_DISK_TYPE} (~${SIM_DISK_GB} GB) x auto disks per shelf (chosen after the OVA is extracted) x ${SIM_SHELVES} shelves"
   else
-    echo "type ${SIM_DISK_TYPE} (~${SIM_DISK_GB} GB) x ${SIM_DISKS_PER_SHELF} x ${SIM_SHELVES} shelves = $(( SIM_DISKS_PER_SHELF * SIM_SHELVES )) disks, vdevinit=${SIM_VDEVINIT}"
+    echo "type ${SIM_DISK_TYPE} (~${SIM_DISK_GB} GB) x ${SIM_DISKS_PER_SHELF} x ${SIM_SHELVES} shelves = $(( SIM_DISKS_PER_SHELF * SIM_SHELVES )) disks, vdevinit=${SIM_VDEVINIT}$( (( SIM_PER_SHELF_AUTO == 1 )) && echo ' [auto]')"
   fi
 }
 
 print_sim_disk_info() {
   echo ""
   echo "Simulated disks (per ONTAP node):"
-  if [[ -z "$SIM_VDEVINIT" ]]; then
+  if (( SIM_ENABLED == 0 )); then
     echo "  SIM_DISK_TYPE not set: OVA default (28 x 1 GB), /env/env is not changed"
     return 0
   fi
-  local total=$(( SIM_DISKS_PER_SHELF * SIM_SHELVES ))
   echo "  disk type             : ${SIM_DISK_TYPE} (nominal ~${SIM_DISK_GB} GB per disk)"
-  echo "  layout                : ${SIM_SHELVES} shelves x ${SIM_DISKS_PER_SHELF} disks = ${total} disks (~$(( total * SIM_DISK_GB )) GB raw)"
+  if [[ -z "$SIM_VDEVINIT" ]]; then
+    echo "  layout                : ${SIM_SHELVES} shelves x auto disks per shelf (highest number <= 14 that fits the sim disk;"
+    echo "                          chosen after the OVA is extracted, or see --show-sim-disk)"
+    return 0
+  fi
+  local total=$(( SIM_DISKS_PER_SHELF * SIM_SHELVES ))
+  echo "  layout                : ${SIM_SHELVES} shelves x ${SIM_DISKS_PER_SHELF} disks = ${total} disks (~$(( total * SIM_DISK_GB )) GB raw)$( (( SIM_PER_SHELF_AUTO == 1 )) && echo ' [auto]')"
   echo "  /env/env (both nodes) : setenv bootarg.vm.sim.vdevinit \"${SIM_VDEVINIT}\""
   echo "                          setenv bootarg.sim.vdevinit \"${SIM_VDEVINIT}\""
   echo "  needed on sim disk    : $(( SIM_NEEDED_MB / 1024 )) GB (incl. ${SIM_DISK_MARGIN_PCT}% margin); checked against ide3 at deploy time"
@@ -1069,13 +1142,12 @@ prepare_vmdks_on_node() {
   echo "[node $target_node] VMDK order: ${_out_disks[*]}"
 }
 
-# Remove the extracted OVA directories. Only called after BOTH nodes were
+# Remove the extracted OVA directories of the given hosts. Only called after BOTH nodes were
 # imported successfully (the script runs with set -e and has no trap, so after
 # an error this is never reached and the files stay for debugging).
 cleanup_extracted() {
-  local -a nodes=("$TARGET_NODE1")
+  local -a nodes=("$@")   # the hosts that extracted
   local node dir
-  same_host "$TARGET_NODE1" "$TARGET_NODE2" || nodes+=("$TARGET_NODE2")
 
   if [[ "$KEEP_EXTRACTED" == "1" ]]; then
     echo "[cleanup] KEEP_EXTRACTED=1: keeping the extracted OVA directories:"
@@ -1090,10 +1162,44 @@ cleanup_extracted() {
   done
 }
 
+# Virtual size of the sim disk (4th extracted VMDK) -> SIM_DISK_AVAIL_MB.
+read_sim_disk_size() {
+  local target_node="$1"
+  local simdisk="$2"
+  local bytes
+  bytes=$(run_on_node "$target_node" qemu-img info --output=json "$simdisk" 2>/dev/null \
+    | python3 -c 'import sys, json; print(json.load(sys.stdin)["virtual-size"])' 2>/dev/null || true)
+  if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: cannot read the size of the sim disk $simdisk on $target_node (qemu-img info)" >&2
+    exit 1
+  fi
+  SIM_DISK_AVAIL_MB=$(( bytes / 1048576 ))
+}
+
+# Resolve SIM_DISKS_PER_SHELF=auto against SIM_DISK_AVAIL_MB and (re)build the
+# layout: the highest number of disks per shelf (max 14) that fits with
+# SIM_SHELVES and SIM_DISK_TYPE. When not even 1 disk per shelf fits it picks 1,
+# so the normal capacity check fails with its usual message.
+sim_resolve_layout() {
+  (( SIM_PER_SHELF_AUTO == 1 )) || return 0
+  local max_disks chosen
+  max_disks=$(sim_max_disks "$SIM_DISK_AVAIL_MB" "$SIM_DISK_GB")
+  chosen=$(( max_disks / SIM_SHELVES ))
+  if (( chosen > 14 )); then chosen=14; fi
+  if (( chosen < 1 )); then
+    chosen=1
+    SIM_AUTO_NOTE="auto: not even 1 disk per shelf fits (using 1 to report the shortfall)"
+  else
+    SIM_AUTO_NOTE="auto -> ${chosen} per shelf (max ${max_disks} disks of type ${SIM_DISK_TYPE} fit, ${SIM_SHELVES} shelves)"
+  fi
+  SIM_DISKS_PER_SHELF=$chosen
+  sim_build_layout
+}
+
 # Capacity check for SIM_DISK_TYPE. Runs ONCE, right after the OVA has been
 # extracted and before the first VM is created or any disk is imported: the OVA
 # (and so the sim disk) is identical for both nodes, and the script must never
-# stop after node 1 has been built.
+# stop after node 1 has been built. Also resolves SIM_DISKS_PER_SHELF=auto.
 # The simulated disks live as files on the 4th OVA disk (ide3, "sim disk"). That
 # disk is NOT resized: the OVA ships it already partitioned/formatted, and
 # qm resize only grows the block device, not the filesystem on it (see README
@@ -1102,19 +1208,14 @@ check_sim_disk_capacity() {
   local target_node="$1"
   local simdisk="$2"   # 4th extracted VMDK on target_node
 
-  [[ -z "$SIM_VDEVINIT" ]] && return 0
+  (( SIM_ENABLED == 1 )) || return 0
 
-  local bytes avail_mb usable_mb per_disk_mb max_disks
-  bytes=$(run_on_node "$target_node" qemu-img info --output=json "$simdisk" 2>/dev/null \
-    | python3 -c 'import sys, json; print(json.load(sys.stdin)["virtual-size"])' 2>/dev/null || true)
-  if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: cannot read the size of the sim disk $simdisk on $target_node (qemu-img info)" >&2
-    exit 1
-  fi
-  avail_mb=$(( bytes / 1048576 ))
-  per_disk_mb=$(( SIM_DISK_GB * 1024 ))
-  usable_mb=$(( avail_mb * 100 / (100 + SIM_DISK_MARGIN_PCT) ))
-  max_disks=$(( usable_mb / per_disk_mb ))
+  read_sim_disk_size "$target_node" "$simdisk"
+  sim_resolve_layout
+  (( SIM_PER_SHELF_AUTO == 1 )) && echo "[sim-disk] SIM_DISKS_PER_SHELF=${SIM_AUTO_NOTE}"
+
+  local avail_mb="$SIM_DISK_AVAIL_MB" max_disks
+  max_disks=$(sim_max_disks "$avail_mb" "$SIM_DISK_GB")
 
   echo "[sim-disk] Sim disk (ide3): $(( avail_mb / 1024 )) GB; needed for ${SIM_VDEVINIT}: $(( SIM_NEEDED_MB / 1024 )) GB (incl. ${SIM_DISK_MARGIN_PCT}% margin)"
   if (( SIM_NEEDED_MB > avail_mb )); then
@@ -1125,6 +1226,87 @@ check_sim_disk_capacity() {
     echo "  Fix       : lower SIM_SHELVES/SIM_DISKS_PER_SHELF, use a smaller SIM_DISK_TYPE or a lower SIM_DISK_MARGIN_PCT." >&2
     echo "  The sim disk is not resized automatically: qm resize does not grow the filesystem on it." >&2
     exit 1
+  fi
+}
+
+# --show-sim-disk: capacity of the sim disk per disk type, without creating a VM.
+print_sim_disk_table() {
+  local usable_mb=$(( SIM_DISK_AVAIL_MB * 100 / (100 + SIM_DISK_MARGIN_PCT) ))
+  local t gb max full rem layout mark
+  local -a types=()
+  mapfile -t types < <(printf '%s\n' "${!SIM_TYPE_GB[@]}" | sort -n)
+  if (( SIM_ENABLED == 1 )) && [[ -z "${SIM_TYPE_GB[$SIM_DISK_TYPE]:-}" ]]; then
+    types+=("$SIM_DISK_TYPE")   # type outside the table, size from SIM_DISK_SIZE_GB
+  fi
+
+  echo ""
+  echo "Sim disk (4th OVA disk, ide3): $(( SIM_DISK_AVAIL_MB / 1024 )) GB virtual; usable with ${SIM_DISK_MARGIN_PCT}% margin: $(( usable_mb / 1024 )) GB"
+  printf '  %-6s %-8s %-10s %s\n' "Type" "GB/disk" "Max disks" "Layout (max 14 per shelf, max 4 shelves)"
+  for t in "${types[@]}"; do
+    gb="${SIM_TYPE_GB[$t]:-0}"
+    mark=""
+    if (( SIM_ENABLED == 1 )) && [[ "$t" == "$SIM_DISK_TYPE" ]]; then gb="$SIM_DISK_GB"; mark="  <- SIM_DISK_TYPE"; fi
+    max=$(sim_max_disks "$SIM_DISK_AVAIL_MB" "$gb")
+    full=$(( max / 14 )); rem=$(( max % 14 )); layout=""
+    if (( full > 0 )); then layout="${full} x 14"; fi
+    if (( rem > 0 )); then layout="${layout:+$layout + }1 x ${rem}"; fi
+    [[ -z "$layout" ]] && layout="does not fit"
+    printf '  %-6s %-8s %-10s %s%s\n' "$t" "$gb" "$max" "$layout" "$mark"
+  done
+}
+
+print_sim_disk_verdict() {
+  echo ""
+  if (( SIM_ENABLED == 0 )); then
+    echo "Current config: SIM_DISK_TYPE not set -> OVA default (28 x 1 GB); nothing to check."
+    return 0
+  fi
+  sim_resolve_layout
+  local max_disks
+  max_disks=$(sim_max_disks "$SIM_DISK_AVAIL_MB" "$SIM_DISK_GB")
+  (( SIM_PER_SHELF_AUTO == 1 )) && echo "Current config: SIM_DISKS_PER_SHELF=${SIM_AUTO_NOTE}"
+  echo "Current config: type ${SIM_DISK_TYPE} (~${SIM_DISK_GB} GB) x ${SIM_DISKS_PER_SHELF} per shelf x ${SIM_SHELVES} shelves = $(( SIM_DISKS_PER_SHELF * SIM_SHELVES )) disks, vdevinit=${SIM_VDEVINIT}"
+  if (( SIM_NEEDED_MB <= SIM_DISK_AVAIL_MB )); then
+    echo "  FITS: needs $(( SIM_NEEDED_MB / 1024 )) GB incl. ${SIM_DISK_MARGIN_PCT}% margin of $(( SIM_DISK_AVAIL_MB / 1024 )) GB"
+  else
+    echo "  DOES NOT FIT: needs $(( SIM_NEEDED_MB / 1024 )) GB incl. ${SIM_DISK_MARGIN_PCT}% margin, sim disk is $(( SIM_DISK_AVAIL_MB / 1024 )) GB (maximum: ${max_disks} disks of type ${SIM_DISK_TYPE})"
+  fi
+}
+
+# Needs a Proxmox host. Reads the sim disk of the OVA on TARGET_NODE1 and prints
+# the capacity. Creates no VM and changes nothing on Proxmox; the only files
+# are the extracted OVA in WORKDIR, which are removed again unless
+# KEEP_EXTRACTED=1. An already extracted directory is reused and left in place
+# (it was not created by this run, and may be kept for debugging).
+show_sim_disk() {
+  local node="$TARGET_NODE1" dir extracted_here=0
+  local -a vmdks=()
+  dir="$(extract_dir_for "$node")"
+  OVA_PATH="$OVA_DIR/$OVA_NAME"
+
+  echo "[show-sim-disk] $(basename "$0") v${SCRIPT_VERSION}: reads the sim disk of the OVA, no VM is created, nothing on Proxmox is changed"
+  node_online "$node" || { echo "ERROR: node $node is not reachable via Proxmox API" >&2; exit 1; }
+  check_ova_path_reachable_for_node "$node" "$OVA_PATH" \
+    || { echo "ERROR: OVA path not readable on node $node: $OVA_PATH" >&2; exit 1; }
+  assert_under_workdir "$dir" || exit 1
+
+  mapfile -t vmdks < <(run_on_node "$node" find "$dir" -maxdepth 1 -type f -iname '*.vmdk' 2>/dev/null | sort -V || true)
+  if (( ${#vmdks[@]} >= 4 )); then
+    echo "[show-sim-disk] Reusing the extracted OVA in $node:$dir (left in place)"
+  else
+    determine_ova_extracted_size "$node"
+    check_workdir_space "$node"
+    prepare_vmdks_on_node "$node" vmdks
+    extracted_here=1
+  fi
+
+  read_sim_disk_size "$node" "${vmdks[3]}"
+  print_sim_disk_table
+  print_sim_disk_verdict
+
+  if (( extracted_here == 1 )); then
+    echo ""
+    cleanup_extracted "$node"
   fi
 }
 
@@ -1570,6 +1752,14 @@ if (( SHOW_PORTS == 1 )); then
   echo "[start] $(basename "$0") v${SCRIPT_VERSION} — network plan only (--show-ports), nothing is changed"
   print_port_info
   print_sim_disk_info
+  echo ""
+  echo "Note: this is a plan only. For the real capacity of the sim disk in the OVA (how many"
+  echo "simulated disks fit per disk type) run: $(basename "$0") --show-sim-disk (on a Proxmox host)."
+  exit 0
+fi
+
+if (( SHOW_SIM_DISK == 1 )); then
+  show_sim_disk
   exit 0
 fi
 
@@ -1604,20 +1794,6 @@ validate_node_access
 alloc_vmids
 derive_node_identities
 
-cat <<INFO
-[1/10] Settings:
-- OVA path:               $OVA_PATH
-- VM storage:             $VM_STORAGE
-- Node1:                  $TARGET_NODE1, VMID $VMID1, name $VMNAME1
-- Node2:                  $TARGET_NODE2, VMID $VMID2, name $VMNAME2
-- Node1 SYS_SERIAL_NUM:   $NODE1_SYS_SERIAL_NUM
-- Node1 SYSID:            $NODE1_SYSID
-- Node2 SYS_SERIAL_NUM:   $NODE2_SYS_SERIAL_NUM
-- Node2 SYSID:            $NODE2_SYSID
-- EXPECT_TIMEOUT:         $EXPECT_TIMEOUT s
-- Sim disks:              $(sim_disk_summary)
-INFO
-
 # 1. Free space on every host that extracts (once per host), 2. extract the OVA
 # (once per host: both nodes on the same host share one directory), 3. check the
 # sim disk ONCE (the OVA is the same for both nodes). Only after all of this the
@@ -1639,11 +1815,29 @@ else
 fi
 check_sim_disk_capacity "$TARGET_NODE1" "${NODE1_VMDKS[3]}"
 
+cat <<INFO
+[1/10] Settings:
+- OVA path:               $OVA_PATH
+- VM storage:             $VM_STORAGE
+- Node1:                  $TARGET_NODE1, VMID $VMID1, name $VMNAME1
+- Node2:                  $TARGET_NODE2, VMID $VMID2, name $VMNAME2
+- Node1 SYS_SERIAL_NUM:   $NODE1_SYS_SERIAL_NUM
+- Node1 SYSID:            $NODE1_SYSID
+- Node2 SYS_SERIAL_NUM:   $NODE2_SYS_SERIAL_NUM
+- Node2 SYSID:            $NODE2_SYSID
+- EXPECT_TIMEOUT:         $EXPECT_TIMEOUT s
+- Sim disks:              $(sim_disk_summary)
+INFO
+
 create_vm "$VMID1" "$VMNAME1" "$TARGET_NODE1" "${AUTOMATE_NODE2_SYSID}" "$NODE1_SYS_SERIAL_NUM" "$NODE1_SYSID" NODE1_VMDKS
 create_vm "$VMID2" "$VMNAME2" "$TARGET_NODE2" "${AUTOMATE_NODE2_SYSID}" "$NODE2_SYS_SERIAL_NUM" "$NODE2_SYSID" NODE2_VMDKS
 
 # Both nodes imported successfully: the extracted files are no longer needed
-cleanup_extracted
+if same_host "$TARGET_NODE1" "$TARGET_NODE2"; then
+  cleanup_extracted "$TARGET_NODE1"
+else
+  cleanup_extracted "$TARGET_NODE1" "$TARGET_NODE2"
+fi
 
 cat <<POST
 

@@ -5,6 +5,28 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.2] – 2026-10-08
+
+Backwards compatible: without the new option and value the behaviour is unchanged.
+
+### Added
+- **`--show-sim-disk`**: determines the capacity of the sim disk without a VM. It extracts the OVA on `TARGET_NODE1` (existing free-space check and extract function) or reuses an existing `extracted-<node>` directory, reads the virtual size of the 4th VMDK with `qemu-img info`, and prints per known disk type the size per disk and the maximum number of disks that fit (with `SIM_DISK_MARGIN_PCT`), spread over shelves (max 14 per shelf, max 4 shelves). It also says whether the current `SIM_DISK_TYPE` / `SIM_DISKS_PER_SHELF` / `SIM_SHELVES` fit. Requires a Proxmox host (`require_proxmox_host`), creates no VM and changes nothing on Proxmox. The extracted directory is removed afterwards unless `KEEP_EXTRACTED=1`.
+- **`SIM_DISKS_PER_SHELF="auto"`**: picks the highest number of disks per shelf (max 14) that fits the sim disk with `SIM_SHELVES` and `SIM_DISK_TYPE`. The value is resolved by `sim_resolve_layout()` once the sim disk size is known, logged (`auto -> N per shelf`) and shown in the settings summary and the VM description. If not even 1 disk per shelf fits, the existing "does not fit" error is raised with the maximum, before any VM is created.
+- `--show-ports` now points to `--show-sim-disk` for the real capacity.
+- `--show-ports` and `--show-sim-disk` cannot be combined.
+
+### Changed
+- The sim disk size is read in one place (`read_sim_disk_size()`); the deploy check, `auto` and `--show-sim-disk` share `sim_max_disks()` and `sim_resolve_layout()`, so they cannot disagree.
+- The needed capacity is now rounded up (was rounded down), so a layout one disk over the maximum can no longer pass the check by a rounding difference of a few MB.
+- In `main` the OVA extraction and the sim-disk check now come before the settings summary, so the summary shows the resolved `auto` value. The VMID check still comes first, so a VMID conflict is reported before anything is extracted.
+- `cleanup_extracted()` now takes the hosts to clean as arguments.
+
+### Notes
+- `--show-sim-disk` reuses an existing `extracted-<node>` directory and leaves it in place: it was not created by that run and may have been kept on purpose (`KEEP_EXTRACTED=1`, or a failed run kept for debugging). It only removes what it extracted itself.
+- The disk size table (23 = ~1 GB, 31 = ~4 GB, 36 = ~9 GB) is still community-sourced. The sim disk size itself is read from the OVA and is not an assumption.
+
+---
+
 ## [v3.1.2] – 2026-10-08
 
 ### Added

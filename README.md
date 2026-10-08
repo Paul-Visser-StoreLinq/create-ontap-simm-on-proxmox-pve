@@ -54,6 +54,12 @@ CLUSTER_NUM=3 ./ontap-sim-2node-proxmox.sh
 # Start VMs immediately after creation
 START_AFTER_CREATE=1 ./ontap-sim-2node-proxmox.sh
 
+# Show how many simulated disks fit in the OVA's sim disk (no VM is created)
+./ontap-sim-2node-proxmox.sh --show-sim-disk
+
+# Let the script choose the number of disks per shelf
+SIM_DISK_TYPE=36 SIM_DISKS_PER_SHELF=auto ./ontap-sim-2node-proxmox.sh
+
 # Specify exact VMIDs
 VMID1=200 VMID2=201 ./ontap-sim-2node-proxmox.sh
 ```
@@ -129,7 +135,7 @@ Files matching `ontap-sim-2node-*-cluster*.conf` are git-ignored so site-specifi
 | Variable | Default | Description |
 |---|---|---|
 | `SIM_DISK_TYPE` | *(empty)* | ONTAP simulator disk type ID (e.g. `36` = ~9 GB). Empty = OVA default (28 × 1 GB), nothing is changed |
-| `SIM_DISKS_PER_SHELF` | `14` | Disks per shelf, 1–14 (only used when `SIM_DISK_TYPE` is set) |
+| `SIM_DISKS_PER_SHELF` | `14` | Disks per shelf, 1–14, or `auto` (only used when `SIM_DISK_TYPE` is set). `auto` picks the highest number per shelf (max 14) that fits the sim disk with `SIM_SHELVES` and `SIM_DISK_TYPE` |
 | `SIM_SHELVES` | `2` | Number of shelves, 1–4 |
 | `SIM_DISK_SIZE_GB` | *(from table)* | Nominal GB per disk. Only needed for types outside the built-in table (23, 31, 36) |
 | `SIM_DISK_MARGIN_PCT` | `10` | Extra room required on the sim disk on top of disks × size |
@@ -171,6 +177,33 @@ Format: `<type>:<disks>:<shelf>` per shelf, comma-separated. The result is check
 | 36 | ~9 GB | largest type the sources agree on |
 
 > **Source quality:** no official NetApp documentation for these values was found. The type table and the `vdevinit` format come from NetApp Community threads and blog posts on `vsim_makedisks` (`-t` type, `-n` disks, `-a` shelf). Confirm the sizes with `vsim_makedisks -h` on your simulator. Other types (e.g. 35, 37) only work with `SIM_DISK_SIZE_GB`.
+
+### Finding out what fits: `--show-sim-disk`
+
+The capacity of the sim disk is read from the OVA itself, so nothing has to be looked up by hand:
+
+```bash
+./ontap-sim-2node-proxmox.sh --show-sim-disk      # on a Proxmox host
+```
+
+It extracts the OVA on `TARGET_NODE1` (with the same free-space check as a deploy) or reuses an existing `extracted-<node>` directory, reads the virtual size of the sim disk (4th VMDK) with `qemu-img info`, and prints for every known disk type the size per disk and the maximum number of disks that fit (including `SIM_DISK_MARGIN_PCT`), spread over shelves (max 14 per shelf, max 4 shelves). Example (a 250 GB sim disk; the real size comes from your OVA):
+
+```
+Sim disk (4th OVA disk, ide3): 250 GB virtual; usable with 10% margin: 227 GB
+  Type   GB/disk  Max disks  Layout (max 14 per shelf, max 4 shelves)
+  23     1        56         4 x 14
+  31     4        56         4 x 14
+  36     9        25         1 x 14 + 1 x 11  <- SIM_DISK_TYPE
+
+Current config: type 36 (~9 GB) x 14 per shelf x 2 shelves = 28 disks, vdevinit=36:14:0,36:14:1
+  DOES NOT FIT: needs 277 GB incl. 10% margin, sim disk is 250 GB (maximum: 25 disks of type 36)
+```
+
+It also says whether the current `SIM_DISK_TYPE` / `SIM_DISKS_PER_SHELF` / `SIM_SHELVES` fit. No VM is created and nothing on Proxmox is changed. The extracted directory is removed afterwards unless `KEEP_EXTRACTED=1`; an already existing directory is reused and left in place. `--show-ports` stays a quick plan without extracting and points to this option.
+
+### `SIM_DISKS_PER_SHELF="auto"`
+
+With `auto` the script picks the highest number of disks per shelf (max 14) so that `SIM_SHELVES` shelves of `SIM_DISK_TYPE` disks fit the sim disk. The size is only known once the OVA is extracted, so the choice is made then and shown in the log and in the settings summary (e.g. `auto -> 12 per shelf`). If not even 1 disk per shelf fits, the script stops with the normal "does not fit" message and the maximum number of disks, before any VM is created.
 
 **What does and does not work**
 
@@ -251,6 +284,7 @@ Then follow the standard ONTAP cluster setup wizard on node1 and join node2 via 
 | v3.1 | 08-10-2026 | Optional bigger simulated disks (`SIM_DISK_TYPE`, `SIM_DISKS_PER_SHELF`, `SIM_SHELVES`) via `bootarg.(vm.)sim.vdevinit` in `/env/env`; one capacity check against the sim disk before the first VM is created |
 | v3.1.1 | 08-10-2026 | Fix: environment variables now really override the config file (they were ignored for every variable the config assigns) |
 | v3.1.2 | 08-10-2026 | Free-space check on `WORKDIR` per host before extracting; OVA extracted once when both nodes share a host; extracted directories removed after a successful run (`KEEP_EXTRACTED`) |
+| v3.2 | 08-10-2026 | `--show-sim-disk` (capacity of the sim disk per disk type, no VM created); `SIM_DISKS_PER_SHELF="auto"` |
 
 ---
 
