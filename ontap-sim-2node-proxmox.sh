@@ -81,6 +81,14 @@
 #                   START_AFTER_CREATE=1 were silently ignored for every variable
 #                   that the config assigns). Environment is saved before
 #                   sourcing the config and restored afterwards.
+# v3.1.2 08-10-2026 Free-space check on WORKDIR before the OVA is extracted, per
+#                   host that extracts (needed = extracted OVA size + 10%).
+#                   Both nodes on the same host: the OVA is extracted once and
+#                   the directory is reused for node 2. Extracted directories
+#                   are removed after both nodes were imported successfully;
+#                   KEEP_EXTRACTED=1 keeps them, and nothing is removed after
+#                   an error (so there is something to debug). Removal only
+#                   touches paths below WORKDIR.
 # =============================================================================
 #
 # DESCRIPTION
@@ -92,7 +100,8 @@
 #   2. VMID       — Cluster-wide allocation of two unique VMIDs
 #   3. Naming     — Automatic cluster number (sim-cluster01-01 / -02)
 #   4. VM create  — Both VMs are created on the specified nodes
-#   5. OVA import — The 4 VMDKs are unpacked and imported per node
+#   5. OVA import — Free space check, OVA unpacked once per host, 4 VMDKs
+#                   imported per node, extracted files removed afterwards
 #   6. Identity   — Unique SYS_SERIAL_NUM and SYSID are written via guestfish
 #                   directly to /env/env on disk1 after import; optionally the
 #                   simulated disk layout (vdevinit) is written there too
@@ -145,7 +154,7 @@
 #   - ONTAP: NODE1_SYS_SERIAL_NUM, NODE1_SYSID, NODE2_SYS_SERIAL_NUM, NODE2_SYSID
 #   - Sim disks (optional): SIM_DISK_TYPE, SIM_DISKS_PER_SHELF, SIM_SHELVES,
 #              SIM_DISK_SIZE_GB, SIM_DISK_MARGIN_PCT
-#   - Runtime: WORKDIR, EXPECT_TIMEOUT, DISK_FORMAT
+#   - Runtime: WORKDIR, KEEP_EXTRACTED, EXPECT_TIMEOUT, DISK_FORMAT
 #
 # Environment variables override config file values.
 #
@@ -189,7 +198,7 @@ set -euo pipefail
 
 # Single source of truth for the script version. Update together with the
 # VERSION HISTORY above, README and CHANGELOG.
-SCRIPT_VERSION="3.1.1"
+SCRIPT_VERSION="3.1.2"
 
 # Default config file location
 CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
@@ -307,6 +316,9 @@ WORKDIR="${WORKDIR:-/var/tmp/ontap-sim-9.16.1}"
 EXPECT_TIMEOUT="${EXPECT_TIMEOUT:-360}"
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new}"
 DISK_FORMAT="${DISK_FORMAT:-raw}"
+# 0 (default) = remove the extracted OVA directories after both nodes were imported
+# successfully; 1 = keep them. After an error they are always kept.
+KEEP_EXTRACTED="${KEEP_EXTRACTED:-0}"
 # Simulated disk layout (optional). Empty SIM_DISK_TYPE = OVA default (28 x 1 GB).
 # The other SIM_* values only get a default (14 / 2 / 10) when SIM_DISK_TYPE is set.
 SIM_DISK_TYPE="${SIM_DISK_TYPE:-}"
@@ -423,6 +435,11 @@ validate_sim_disk_config() {
 }
 
 validate_sim_disk_config
+
+if [[ "$KEEP_EXTRACTED" != "0" && "$KEEP_EXTRACTED" != "1" ]]; then
+  echo "ERROR: KEEP_EXTRACTED must be 0 or 1 (value: '$KEEP_EXTRACTED')" >&2
+  exit 1
+fi
 
 # One-line description of the sim disk setting (startup summary, VM description)
 sim_disk_summary() {
@@ -947,12 +964,93 @@ ensure_machine_type() {
   run_on_node "$target_node" qm set "$vmid" --machine pc-i440fx-7.2 >/dev/null 2>&1 || true
 }
 
+# ---------- Extract directory (WORKDIR) ----------
+EXTRACT_MARGIN_PCT=10   # room required on top of the extracted OVA size
+OVA_NEEDED_MB=0         # extracted size + margin; same OVA for every node
+OVA_SIZE_SOURCE=""      # how OVA_NEEDED_MB was determined (shown in the log)
+
+extract_dir_for() { echo "${WORKDIR%/}/extracted-$1"; }
+
+# Both nodes on the same host (same name, case-insensitive) share one extract dir.
+same_host() { [[ "${1,,}" == "${2,,}" ]]; }
+
+# Every rm -rf goes through this guard: WORKDIR must be an absolute, non-root
+# path and the target must be strictly below it (no empty path, no "..").
+assert_under_workdir() {
+  local path="$1"
+  if [[ -z "${WORKDIR:-}" || "$WORKDIR" != /* || "${WORKDIR%/}" == "" ]]; then
+    echo "ERROR: refusing to remove anything: WORKDIR is empty, relative or '/' (value: '${WORKDIR:-}')" >&2
+    return 1
+  fi
+  if [[ -z "$path" || "$path" == *..* || "$path" != "${WORKDIR%/}/"?* ]]; then
+    echo "ERROR: refusing to remove '$path': not a path below WORKDIR ($WORKDIR)" >&2
+    return 1
+  fi
+}
+
+# Extracted size of the OVA, determined once (it is the same OVA for every node).
+# Preferred: sum of the member sizes in the tar listing (exactly what extraction
+# writes). Fallback when the listing is not available: the OVA file size. That is
+# a valid estimate because an OVA is an uncompressed tar archive, so factor 1.0;
+# the margin below covers tar padding. EXTRACT_MARGIN_PCT is added on top.
+determine_ova_extracted_size() {
+  local node="$1" bytes
+  (( OVA_NEEDED_MB > 0 )) && return 0
+
+  bytes=$(run_on_node "$node" tar -tvf "$OVA_PATH" 2>/dev/null \
+    | awk '{ s += $3 } END { printf "%.0f", s }' || true)
+  if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > 0 )); then
+    OVA_SIZE_SOURCE="tar listing"
+  else
+    bytes=$(run_on_node "$node" stat -Lc %s "$OVA_PATH" 2>/dev/null || true)
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]] || (( bytes == 0 )); then
+      echo "ERROR: cannot determine the size of the OVA $OVA_PATH on $node (tar -tvf and stat both failed)" >&2
+      exit 1
+    fi
+    OVA_SIZE_SOURCE="OVA file size x 1.0 (tar listing unavailable; an OVA is an uncompressed tar)"
+  fi
+  OVA_NEEDED_MB=$(( ( (bytes + 1048575) / 1048576 ) * (100 + EXTRACT_MARGIN_PCT) / 100 ))
+}
+
+# Free space on WORKDIR of one host, before anything is extracted or created.
+# A leftover extract dir from an earlier run is wiped before extraction, so its
+# size counts as available.
+check_workdir_space() {
+  local node="$1"
+  local dir free_mb existing_mb avail_mb
+  dir="$(extract_dir_for "$node")"
+
+  run_on_node "$node" mkdir -p "$WORKDIR" \
+    || { echo "ERROR: cannot create WORKDIR $WORKDIR on $node" >&2; exit 1; }
+  free_mb=$(run_on_node "$node" df -Pm "$WORKDIR" 2>/dev/null | awk 'NR==2 { print $4 }' || true)
+  if ! [[ "$free_mb" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: cannot read the free space of $WORKDIR on $node (df -Pm)" >&2
+    exit 1
+  fi
+  existing_mb=$(run_on_node "$node" du -sm "$dir" 2>/dev/null | awk '{ print $1 }' || true)
+  [[ "$existing_mb" =~ ^[0-9]+$ ]] || existing_mb=0
+  avail_mb=$(( free_mb + existing_mb ))
+
+  echo "[space] $node:$WORKDIR  needed $(( OVA_NEEDED_MB / 1024 )).$(( OVA_NEEDED_MB % 1024 * 10 / 1024 )) GB (OVA via ${OVA_SIZE_SOURCE} + ${EXTRACT_MARGIN_PCT}%), free ${free_mb} MB + ${existing_mb} MB reusable"
+  if (( avail_mb < OVA_NEEDED_MB )); then
+    echo "ERROR: not enough free space to extract the OVA. Nothing has been created." >&2
+    echo "  Host   : $node" >&2
+    echo "  Path   : $WORKDIR" >&2
+    echo "  Needed : ${OVA_NEEDED_MB} MB (${OVA_SIZE_SOURCE}, +${EXTRACT_MARGIN_PCT}% margin)" >&2
+    echo "  Free   : ${free_mb} MB (+ ${existing_mb} MB in an old $dir that will be replaced)" >&2
+    echo "  Fix    : free up space, or point WORKDIR at a larger filesystem." >&2
+    exit 1
+  fi
+}
+
 # FIX: prepare_vmdks_on_node now writes to a local nameref so
 #      node1 and node2 don't overwrite each other (was global NODE_DISKS).
 prepare_vmdks_on_node() {
   local target_node="$1"
   local -n _out_disks="$2"   # nameref: caller provides name of their own array
-  local extract_dir="$WORKDIR/extracted-$target_node"
+  local extract_dir
+  extract_dir="$(extract_dir_for "$target_node")"
+  assert_under_workdir "$extract_dir" || exit 1
 
   echo "[node $target_node] Extract OVA locally on node in $extract_dir"
   run_on_node "$target_node" mkdir -p "$extract_dir"
@@ -969,6 +1067,27 @@ prepare_vmdks_on_node() {
 
   _out_disks=("${_out_disks[0]}" "${_out_disks[1]}" "${_out_disks[2]}" "${_out_disks[3]}")
   echo "[node $target_node] VMDK order: ${_out_disks[*]}"
+}
+
+# Remove the extracted OVA directories. Only called after BOTH nodes were
+# imported successfully (the script runs with set -e and has no trap, so after
+# an error this is never reached and the files stay for debugging).
+cleanup_extracted() {
+  local -a nodes=("$TARGET_NODE1")
+  local node dir
+  same_host "$TARGET_NODE1" "$TARGET_NODE2" || nodes+=("$TARGET_NODE2")
+
+  if [[ "$KEEP_EXTRACTED" == "1" ]]; then
+    echo "[cleanup] KEEP_EXTRACTED=1: keeping the extracted OVA directories:"
+    for node in "${nodes[@]}"; do echo "  $node:$(extract_dir_for "$node")"; done
+    return 0
+  fi
+  for node in "${nodes[@]}"; do
+    dir="$(extract_dir_for "$node")"
+    assert_under_workdir "$dir" || { echo "WARN: [cleanup] skipped $node" >&2; continue; }
+    echo "[cleanup] Remove $node:$dir"
+    run_on_node "$node" rm -rf -- "$dir" || echo "WARN: [cleanup] could not remove $dir on $node" >&2
+  done
 }
 
 # Capacity check for SIM_DISK_TYPE. Runs ONCE, right after the OVA has been
@@ -1499,18 +1618,32 @@ cat <<INFO
 - Sim disks:              $(sim_disk_summary)
 INFO
 
-# Extract the OVA on both nodes first, then check the sim disk ONCE (the OVA is
-# the same for both nodes). Only after this the first VM is created, so a failure
-# here never leaves a half-built cluster behind.
+# 1. Free space on every host that extracts (once per host), 2. extract the OVA
+# (once per host: both nodes on the same host share one directory), 3. check the
+# sim disk ONCE (the OVA is the same for both nodes). Only after all of this the
+# first VM is created, so a failure here never leaves a half-built cluster behind.
 # NODEn_VMDKS are read through a nameref inside create_vm (shellcheck cannot see that)
 # shellcheck disable=SC2034
 declare -a NODE1_VMDKS=() NODE2_VMDKS=()
+determine_ova_extracted_size "$TARGET_NODE1"
+check_workdir_space "$TARGET_NODE1"
+same_host "$TARGET_NODE1" "$TARGET_NODE2" || check_workdir_space "$TARGET_NODE2"
+
 prepare_vmdks_on_node "$TARGET_NODE1" NODE1_VMDKS
-prepare_vmdks_on_node "$TARGET_NODE2" NODE2_VMDKS
+if same_host "$TARGET_NODE1" "$TARGET_NODE2"; then
+  echo "[node $TARGET_NODE2] Same host as node 1: reusing the extracted OVA, not extracting again"
+  # shellcheck disable=SC2034
+  NODE2_VMDKS=("${NODE1_VMDKS[@]}")
+else
+  prepare_vmdks_on_node "$TARGET_NODE2" NODE2_VMDKS
+fi
 check_sim_disk_capacity "$TARGET_NODE1" "${NODE1_VMDKS[3]}"
 
 create_vm "$VMID1" "$VMNAME1" "$TARGET_NODE1" "${AUTOMATE_NODE2_SYSID}" "$NODE1_SYS_SERIAL_NUM" "$NODE1_SYSID" NODE1_VMDKS
 create_vm "$VMID2" "$VMNAME2" "$TARGET_NODE2" "${AUTOMATE_NODE2_SYSID}" "$NODE2_SYS_SERIAL_NUM" "$NODE2_SYSID" NODE2_VMDKS
+
+# Both nodes imported successfully: the extracted files are no longer needed
+cleanup_extracted
 
 cat <<POST
 

@@ -5,6 +5,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.1.2] – 2026-10-08
+
+### Added
+- **Free-space check on `WORKDIR`** before the OVA is extracted, once per host that extracts (`check_workdir_space()`). Needed = extracted OVA size + 10%. The size is taken from the tar listing (`determine_ova_extracted_size()`); when that is unavailable it falls back to the OVA file size × 1.0 (an OVA is an uncompressed tar, so this is accurate; the margin covers tar padding). An old `extracted-<node>` directory from a previous run counts as available since it is replaced. When there is not enough space the script stops with host, path, needed and free, before any VM exists.
+- **`KEEP_EXTRACTED`** (default `0`) in the config and the script: remove (`0`) or keep (`1`) the extracted OVA directories after a successful run. Validated as 0 or 1.
+- `cleanup_extracted()`: removes `WORKDIR/extracted-<node>` after both nodes were imported successfully. There is no `trap`, so after any error nothing is removed and the files stay for debugging.
+- `assert_under_workdir()`: every `rm -rf` of an extract directory goes through it. It refuses an empty, relative or `/` `WORKDIR`, an empty path, a path containing `..` and any path that is not strictly below `WORKDIR`.
+
+### Changed
+- **Both nodes on the same host** (same `TARGET_NODE1`/`TARGET_NODE2` name, case-insensitive): the OVA is extracted once and node 2 reuses the directory (before: extracted twice into the same directory). On different hosts the behaviour is as before: one extraction per host.
+- The extract directory is now derived by `extract_dir_for()` and guarded before the existing `rm -rf` inside `prepare_vmdks_on_node()`.
+
+### Notes
+- Existing local configs keep working without edits (`KEEP_EXTRACTED` defaults to `0`). **Behaviour change:** the extracted directories used to stay behind after a run; they are now removed on success. Set `KEEP_EXTRACTED=1` for the old behaviour.
+- "Same host" means the same node name. Two different names that resolve to one machine (e.g. short name vs FQDN) are treated as two hosts: two extractions, still correct.
+
+---
+
 ## [v3.1.1] – 2026-10-08
 
 ### Fixed

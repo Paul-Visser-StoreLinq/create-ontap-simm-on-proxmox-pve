@@ -142,6 +142,14 @@ See [Simulated disks](#simulated-disks) below for what this does and what it can
 |---|---|---|
 | `START_AFTER_CREATE` | `0` | Start VMs immediately after creation (`1` = yes) |
 | `AUTOMATE_NODE2_SYSID` | `1` | Inject serial numbers via guestfish (`1` = yes) |
+| `WORKDIR` | `/var/tmp/ontap-sim-9.16.1` | Working directory on every host that runs a node; the OVA is extracted below it |
+| `KEEP_EXTRACTED` | `0` | `0` = remove the extracted OVA directories after both nodes were imported successfully, `1` = keep them |
+
+### Disk space and cleanup
+
+- **Free-space check.** Before anything is extracted or created, the script checks `WORKDIR` on every host that extracts: needed = extracted size of the OVA + 10%. The extracted size comes from the tar listing (exactly what extraction writes); if the listing is not available it falls back to the OVA file size × 1.0, which is valid because an OVA is an uncompressed tar archive (the 10% margin covers tar padding). An old `extracted-<node>` directory from an earlier run counts as available, because it is replaced. Too little space: the script stops with host, path, needed and free, and nothing has been created.
+- **One extraction per host.** If both nodes run on the same host (`TARGET_NODE1` and `TARGET_NODE2` have the same name), the OVA is extracted once and node 2 reuses the directory. On different hosts each host extracts its own copy.
+- **Cleanup.** After both nodes were imported successfully, the `extracted-<node>` directories are removed. After an error nothing is removed, so the files can be inspected. `KEEP_EXTRACTED=1` keeps them always. Removal only touches paths strictly below an absolute `WORKDIR`; an empty or relative `WORKDIR`, `/`, or a path containing `..` is refused.
 
 ---
 
@@ -242,6 +250,7 @@ Then follow the standard ONTAP cluster setup wizard on node1 and join node2 via 
 | v3.0 | 08-10-2026 | Cluster interconnect on separate `CLUSTER_BRIDGE`/`CLUSTER_VLAN_TAG` (required); CIFS defaults to data network; version no longer in filename; `--version`, `--show-ports` |
 | v3.1 | 08-10-2026 | Optional bigger simulated disks (`SIM_DISK_TYPE`, `SIM_DISKS_PER_SHELF`, `SIM_SHELVES`) via `bootarg.(vm.)sim.vdevinit` in `/env/env`; one capacity check against the sim disk before the first VM is created |
 | v3.1.1 | 08-10-2026 | Fix: environment variables now really override the config file (they were ignored for every variable the config assigns) |
+| v3.1.2 | 08-10-2026 | Free-space check on `WORKDIR` per host before extracting; OVA extracted once when both nodes share a host; extracted directories removed after a successful run (`KEEP_EXTRACTED`) |
 
 ---
 
