@@ -41,6 +41,9 @@ The script performs the following steps automatically:
 # Basic usage with all defaults
 ./ontap-sim-2node-proxmox.sh
 
+# Environment variables always win over the config file
+# (set variable in the environment > config file > built-in default)
+
 # Custom nodes and prefix
 TARGET_NODE1=pve01 TARGET_NODE2=pve02 CLUSTER_PREFIX=lab \
   ./ontap-sim-2node-proxmox.sh
@@ -238,6 +241,7 @@ Then follow the standard ONTAP cluster setup wizard on node1 and join node2 via 
 | v2.6 | 17-04-2026 | Set fixed ONTAP Simulator license serials: node1=`4082368-50-7`, node2=`4034389-06-2` |
 | v3.0 | 08-10-2026 | Cluster interconnect on separate `CLUSTER_BRIDGE`/`CLUSTER_VLAN_TAG` (required); CIFS defaults to data network; version no longer in filename; `--version`, `--show-ports` |
 | v3.1 | 08-10-2026 | Optional bigger simulated disks (`SIM_DISK_TYPE`, `SIM_DISKS_PER_SHELF`, `SIM_SHELVES`) via `bootarg.(vm.)sim.vdevinit` in `/env/env`; one capacity check against the sim disk before the first VM is created |
+| v3.1.1 | 08-10-2026 | Fix: environment variables now really override the config file (they were ignored for every variable the config assigns) |
 
 ---
 

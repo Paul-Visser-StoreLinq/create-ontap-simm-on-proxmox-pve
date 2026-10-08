@@ -5,6 +5,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.1.1] – 2026-10-08
+
+### Fixed
+- **Environment variables did not override the config file.** The header, `--help` and the README promise this (`VMID1=200 ./ontap-sim-2node-proxmox.sh`, `CLUSTER_NUM=3`, `START_AFTER_CREATE=1`), but the config assigns every variable unconditionally after the environment was read, so the environment value was silently thrown away. This affected every variable in the config (all 31 of them), and existed before v3.1.
+- The script now remembers which config variables are already set in the environment before sourcing the config, and restores those values afterwards. No change to the config format, so existing local configs keep working without edits.
+
+### Notes
+- A variable set in the environment but empty also wins (an empty `CLUSTER_VLAN_TAG` in the environment still triggers the "not set" error).
+- Derived defaults follow the config, not the environment: setting only `OVA_STORAGE_ID` does not move `OVA_DIR`, because the config computes `OVA_DIR` from its own `OVA_STORAGE_ID`. Set both, or `OVA_DIR` directly.
+
+---
+
 ## [v3.1] – 2026-10-08
 
 Backwards compatible: without the new variables the behaviour is unchanged (OVA default disks, `/env/env` only gets the serial/sysid).

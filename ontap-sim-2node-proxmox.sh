@@ -76,6 +76,11 @@
 #                   OVA is now extracted for both nodes up front. Shown in
 #                   the startup summary, --show-ports and the VM description.
 #                   Unset = behaviour unchanged (OVA default disks).
+# v3.1.1 08-10-2026 Fix: environment variables now really override the config
+#                   file (the README examples VMID1=200, CLUSTER_NUM=3 and
+#                   START_AFTER_CREATE=1 were silently ignored for every variable
+#                   that the config assigns). Environment is saved before
+#                   sourcing the config and restored afterwards.
 # =============================================================================
 #
 # DESCRIPTION
@@ -184,7 +189,7 @@ set -euo pipefail
 
 # Single source of truth for the script version. Update together with the
 # VERSION HISTORY above, README and CHANGELOG.
-SCRIPT_VERSION="3.1"
+SCRIPT_VERSION="3.1.1"
 
 # Default config file location
 CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
@@ -246,11 +251,26 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   exit 1
 fi
 
+# Environment variables must win over the config file. The config assigns its
+# variables unconditionally, so remember which of them are already set in the
+# environment, source the config, and put those values back afterwards.
+declare -A ENV_OVERRIDES=()
+while IFS= read -r _cfg_var; do
+  if [[ -n "${!_cfg_var+x}" ]]; then
+    ENV_OVERRIDES[$_cfg_var]="${!_cfg_var}"
+  fi
+done < <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$CONFIG_FILE" | tr -d '=')
+
 # Source configuration file
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-# Allow environment variables to override config file values
+for _cfg_var in "${!ENV_OVERRIDES[@]}"; do
+  printf -v "$_cfg_var" '%s' "${ENV_OVERRIDES[$_cfg_var]}"
+done
+unset _cfg_var
+
+# Defaults for everything the config file (and the environment) left unset
 VM_STORAGE="${VM_STORAGE:-datastore_ds02}"
 OVA_STORAGE_ID="${OVA_STORAGE_ID:-software}"
 OVA_DIR="${OVA_DIR:-/mnt/pve/${OVA_STORAGE_ID}/template/iso}"
