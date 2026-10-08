@@ -121,12 +121,53 @@ Files matching `ontap-sim-2node-*-cluster*.conf` are git-ignored so site-specifi
 | `CPU_TYPE` | `SandyBridge` | QEMU CPU type |
 | `DISK_FORMAT` | `raw` | Disk format for import (`raw` or `qcow2`) |
 
+### Simulated disks (optional)
+
+| Variable | Default | Description |
+|---|---|---|
+| `SIM_DISK_TYPE` | *(empty)* | ONTAP simulator disk type ID (e.g. `36` = ~9 GB). Empty = OVA default (28 × 1 GB), nothing is changed |
+| `SIM_DISKS_PER_SHELF` | `14` | Disks per shelf, 1–14 (only used when `SIM_DISK_TYPE` is set) |
+| `SIM_SHELVES` | `2` | Number of shelves, 1–4 |
+| `SIM_DISK_SIZE_GB` | *(from table)* | Nominal GB per disk. Only needed for types outside the built-in table (23, 31, 36) |
+| `SIM_DISK_MARGIN_PCT` | `10` | Extra room required on the sim disk on top of disks × size |
+
+See [Simulated disks](#simulated-disks) below for what this does and what it cannot do.
+
 ### Behaviour
 
 | Variable | Default | Description |
 |---|---|---|
 | `START_AFTER_CREATE` | `0` | Start VMs immediately after creation (`1` = yes) |
 | `AUTOMATE_NODE2_SYSID` | `1` | Inject serial numbers via guestfish (`1` = yes) |
+
+---
+
+## Simulated disks
+
+By default the simulator has 28 disks of 1 GB. With `SIM_DISK_TYPE` set, the script writes the disk layout to `/env/env` of both nodes, in the same guestfish inject as the serial/sysid, so it is in place before the first boot:
+
+```
+setenv bootarg.vm.sim.vdevinit "36:14:0,36:14:1"
+setenv bootarg.sim.vdevinit "36:14:0,36:14:1"
+```
+
+Format: `<type>:<disks>:<shelf>` per shelf, comma-separated. The result is checked after writing, just like the serial. `--show-ports` prints the planned layout without changing anything.
+
+| Type | Nominal size | Note |
+|---|---|---|
+| 23 | ~1 GB | OVA default |
+| 31 | ~4 GB | |
+| 36 | ~9 GB | largest type the sources agree on |
+
+> **Source quality:** no official NetApp documentation for these values was found. The type table and the `vdevinit` format come from NetApp Community threads and blog posts on `vsim_makedisks` (`-t` type, `-n` disks, `-a` shelf). Confirm the sizes with `vsim_makedisks -h` on your simulator. Other types (e.g. 35, 37) only work with `SIM_DISK_SIZE_GB`.
+
+**What does and does not work**
+
+- `vdevinit` is, according to the community sources, only effective on a fresh simulator (before the first boot). Changing it on a node that has already booted is not supported by this script; redeploy the VM instead.
+- The simulated disks are files on the 4th OVA disk (`ide3`). Right after the OVA has been extracted, and before the first VM is created, the script reads that disk's size once (the OVA is the same for both nodes) and stops with an error and the maximum number of disks if the layout (disks × size + `SIM_DISK_MARGIN_PCT`) does not fit. At that point nothing has been created on Proxmox.
+- The sim disk is **not** resized. `qm resize` only grows the block device; it does not grow the partition or the filesystem inside it, and it could not be established that the simulator does that on first boot. Treat the size in the OVA as the limit.
+- Limits: 14 disks per shelf, 4 shelves, 56 disks.
+- Still to verify on a real deploy: the actual size of the sim disk in `vsim-netapp-DOT9.16.1-cm_nodar.ova`, whether the simulated disks are sparse files, and that ONTAP shows the new disks after the first boot (`storage disk show`).
 
 ---
 
@@ -196,6 +237,7 @@ Then follow the standard ONTAP cluster setup wizard on node1 and join node2 via 
 | v2.5 | 17-04-2026 | Moved inject from VMDK to imported RAW disk; guestfish upload on RAW works reliably |
 | v2.6 | 17-04-2026 | Set fixed ONTAP Simulator license serials: node1=`4082368-50-7`, node2=`4034389-06-2` |
 | v3.0 | 08-10-2026 | Cluster interconnect on separate `CLUSTER_BRIDGE`/`CLUSTER_VLAN_TAG` (required); CIFS defaults to data network; version no longer in filename; `--version`, `--show-ports` |
+| v3.1 | 08-10-2026 | Optional bigger simulated disks (`SIM_DISK_TYPE`, `SIM_DISKS_PER_SHELF`, `SIM_SHELVES`) via `bootarg.(vm.)sim.vdevinit` in `/env/env`; one capacity check against the sim disk before the first VM is created |
 
 ---
 

@@ -5,6 +5,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.1] – 2026-10-08
+
+Backwards compatible: without the new variables the behaviour is unchanged (OVA default disks, `/env/env` only gets the serial/sysid).
+
+### Added
+- Optional larger simulated disks, configured at deploy time (before the first boot): `SIM_DISK_TYPE`, `SIM_DISKS_PER_SHELF` (1–14, default 14), `SIM_SHELVES` (1–4, default 2), plus `SIM_DISK_SIZE_GB` (for types outside the built-in table) and `SIM_DISK_MARGIN_PCT` (default 10).
+- `setenv bootarg.vm.sim.vdevinit` and `setenv bootarg.sim.vdevinit` (`<type>:<disks>:<shelf>,...`) are written to `/env/env` of both nodes by the existing guestfish inject. Earlier vdevinit lines are replaced (no duplicates on a re-run) and both lines are verified after writing, like the serial.
+- `validate_sim_disk_config()`: startup validation (type, ranges, size table, requires `AUTOMATE_NODE2_SYSID=1`).
+- `check_sim_disk_capacity()`: reads the size of the sim disk (4th OVA disk, `ide3`) with `qemu-img info`. It runs **once**, right after the OVA has been extracted and before the first VM is created (the OVA is the same for both nodes). If disks × size + margin does not fit, it stops with the maximum number of disks for that type, and no VM exists yet.
+- The disk setting is shown in the startup summary, in `--show-ports` (`print_sim_disk_info()`), at the end of the run and in the VM description.
+
+### Changed
+- The OVA is now extracted for both nodes up front (new in `main`), before `create_vm` runs; `create_vm` receives the extracted VMDK list as its 7th argument. Without `SIM_DISK_TYPE` this only changes the order of the steps, not the result.
+
+### Notes
+- The sim disk is deliberately **not** resized with `qm resize`: that only grows the block device, not the filesystem inside it, and it could not be confirmed that the simulator grows it on first boot. See README, "Simulated disks".
+- The disk type table (23 = ~1 GB, 31 = ~4 GB, 36 = ~9 GB) and the `vdevinit` format are based on NetApp Community posts, not on official documentation. Verify with `vsim_makedisks -h`.
+
+---
+
 ## [v3.0] – 2026-10-08
 
 > **Breaking:** configs written for v2.x are not compatible. `CLUSTER_VLAN_TAG` is now required; the script stops with an error if it is empty.

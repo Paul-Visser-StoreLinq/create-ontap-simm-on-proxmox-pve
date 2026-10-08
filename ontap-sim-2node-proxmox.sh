@@ -64,6 +64,18 @@
 #                   require_proxmox_host(): duidelijke melding als het script
 #                   niet op een Proxmox-host draait.
 #                   NIET compatibel met v2.x configs: CLUSTER_VLAN_TAG vereist.
+# v3.1  08-10-2026  Optional larger simulated disks, set during deploy (before
+#                   first boot): SIM_DISK_TYPE / SIM_DISKS_PER_SHELF /
+#                   SIM_SHELVES are written as bootarg.vm.sim.vdevinit and
+#                   bootarg.sim.vdevinit into /env/env by the same guestfish
+#                   inject as the serial/sysid (verified after writing).
+#                   Capacity check against the sim disk (ide3), once, right
+#                   after the OVA is extracted and before the first VM is
+#                   created: stops with the maximum number of disks when it
+#                   does not fit. The disk is NOT resized (see README). The
+#                   OVA is now extracted for both nodes up front. Shown in
+#                   the startup summary, --show-ports and the VM description.
+#                   Unset = behaviour unchanged (OVA default disks).
 # =============================================================================
 #
 # DESCRIPTION
@@ -77,7 +89,8 @@
 #   4. VM create  — Both VMs are created on the specified nodes
 #   5. OVA import — The 4 VMDKs are unpacked and imported per node
 #   6. Identity   — Unique SYS_SERIAL_NUM and SYSID are written via guestfish
-#                   directly to loader.conf on disk1 before import
+#                   directly to /env/env on disk1 after import; optionally the
+#                   simulated disk layout (vdevinit) is written there too
 #   7. Config     — Disks attached to IDE0-3, boot order set
 #
 # REQUIREMENTS
@@ -125,6 +138,8 @@
 #              DATA_VLAN_TAG, CIFS_BRIDGE, CIFS_VLAN_TAG, NUM_NET_PORTS
 #   - Hardware: CORES, SOCKETS, MEMORY_MB, CPU_TYPE, NET_MODEL
 #   - ONTAP: NODE1_SYS_SERIAL_NUM, NODE1_SYSID, NODE2_SYS_SERIAL_NUM, NODE2_SYSID
+#   - Sim disks (optional): SIM_DISK_TYPE, SIM_DISKS_PER_SHELF, SIM_SHELVES,
+#              SIM_DISK_SIZE_GB, SIM_DISK_MARGIN_PCT
 #   - Runtime: WORKDIR, EXPECT_TIMEOUT, DISK_FORMAT
 #
 # Environment variables override config file values.
@@ -169,7 +184,7 @@ set -euo pipefail
 
 # Single source of truth for the script version. Update together with the
 # VERSION HISTORY above, README and CHANGELOG.
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="3.1"
 
 # Default config file location
 CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
@@ -272,6 +287,13 @@ WORKDIR="${WORKDIR:-/var/tmp/ontap-sim-9.16.1}"
 EXPECT_TIMEOUT="${EXPECT_TIMEOUT:-360}"
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new}"
 DISK_FORMAT="${DISK_FORMAT:-raw}"
+# Simulated disk layout (optional). Empty SIM_DISK_TYPE = OVA default (28 x 1 GB).
+# The other SIM_* values only get a default (14 / 2 / 10) when SIM_DISK_TYPE is set.
+SIM_DISK_TYPE="${SIM_DISK_TYPE:-}"
+SIM_DISKS_PER_SHELF="${SIM_DISKS_PER_SHELF:-}"
+SIM_SHELVES="${SIM_SHELVES:-}"
+SIM_DISK_SIZE_GB="${SIM_DISK_SIZE_GB:-}"
+SIM_DISK_MARGIN_PCT="${SIM_DISK_MARGIN_PCT:-}"
 
 # Initialize VM names (will be set in alloc_vmids())
 VMNAME1=""
@@ -305,6 +327,106 @@ validate_network_config() {
 }
 
 validate_network_config
+
+# ---------- Simulated disk layout (vdevinit) ----------
+# Nominal size per disk type, in GB. Community-sourced (see README "Simulated
+# disks"): 23 = default 1 GB disk, 31 = 4 GB, 36 = 9 GB. Verify with
+# `vsim_makedisks -h` on the simulator. Other types need SIM_DISK_SIZE_GB.
+declare -A SIM_TYPE_GB=( [23]=1 [31]=4 [36]=9 )
+SIM_VDEVINIT=""      # value for bootarg.(vm.)sim.vdevinit; empty = feature off
+SIM_DISK_GB=0        # nominal GB per simulated disk
+SIM_NEEDED_MB=0      # disks x size + margin
+
+# Runs before anything touches Proxmox. Unset SIM_DISK_TYPE = nothing changes.
+validate_sim_disk_config() {
+  [[ -z "$SIM_DISK_TYPE" ]] && return 0
+
+  local var
+  SIM_DISKS_PER_SHELF="${SIM_DISKS_PER_SHELF:-14}"
+  SIM_SHELVES="${SIM_SHELVES:-2}"
+  SIM_DISK_MARGIN_PCT="${SIM_DISK_MARGIN_PCT:-10}"
+
+  for var in SIM_DISK_TYPE SIM_DISKS_PER_SHELF SIM_SHELVES SIM_DISK_MARGIN_PCT; do
+    if ! [[ "${!var}" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: $var must be a whole number (value: '${!var}')" >&2
+      exit 1
+    fi
+  done
+  if (( 10#$SIM_DISKS_PER_SHELF < 1 || 10#$SIM_DISKS_PER_SHELF > 14 )); then
+    echo "ERROR: SIM_DISKS_PER_SHELF must be 1-14 (value: '$SIM_DISKS_PER_SHELF')" >&2
+    exit 1
+  fi
+  if (( 10#$SIM_SHELVES < 1 || 10#$SIM_SHELVES > 4 )); then
+    echo "ERROR: SIM_SHELVES must be 1-4 (value: '$SIM_SHELVES')" >&2
+    exit 1
+  fi
+  if (( 10#$SIM_DISK_MARGIN_PCT > 100 )); then
+    echo "ERROR: SIM_DISK_MARGIN_PCT must be 0-100 (value: '$SIM_DISK_MARGIN_PCT')" >&2
+    exit 1
+  fi
+  if [[ "$AUTOMATE_NODE2_SYSID" != "1" ]]; then
+    echo "ERROR: SIM_DISK_TYPE needs the /env/env inject (AUTOMATE_NODE2_SYSID=1)." >&2
+    exit 1
+  fi
+
+  # Normalize (strip leading zeros) before use
+  SIM_DISK_TYPE=$((10#$SIM_DISK_TYPE))
+  SIM_DISKS_PER_SHELF=$((10#$SIM_DISKS_PER_SHELF))
+  SIM_SHELVES=$((10#$SIM_SHELVES))
+  SIM_DISK_MARGIN_PCT=$((10#$SIM_DISK_MARGIN_PCT))
+
+  if [[ -n "$SIM_DISK_SIZE_GB" ]]; then
+    if ! [[ "$SIM_DISK_SIZE_GB" =~ ^[0-9]+$ ]] || (( 10#$SIM_DISK_SIZE_GB < 1 )); then
+      echo "ERROR: SIM_DISK_SIZE_GB must be a whole number >= 1 (value: '$SIM_DISK_SIZE_GB')" >&2
+      exit 1
+    fi
+    SIM_DISK_GB=$((10#$SIM_DISK_SIZE_GB))
+  elif [[ -n "${SIM_TYPE_GB[$SIM_DISK_TYPE]:-}" ]]; then
+    SIM_DISK_GB="${SIM_TYPE_GB[$SIM_DISK_TYPE]}"
+  else
+    echo "ERROR: SIM_DISK_TYPE=$SIM_DISK_TYPE is not in the script's size table." >&2
+    echo "  Known types (nominal GB): $(for var in $(printf '%s\n' "${!SIM_TYPE_GB[@]}" | sort -n); do printf '%s=%s ' "$var" "${SIM_TYPE_GB[$var]}"; done)" >&2
+    echo "  For another type, look up its size with 'vsim_makedisks -h' on a simulator" >&2
+    echo "  and set SIM_DISK_SIZE_GB (nominal GB per disk) as well." >&2
+    exit 1
+  fi
+
+  # Format: <type>:<disks>:<shelf>,... one entry per shelf (shelf numbers from 0)
+  local shelf entries=()
+  for (( shelf=0; shelf<SIM_SHELVES; shelf++ )); do
+    entries+=("${SIM_DISK_TYPE}:${SIM_DISKS_PER_SHELF}:${shelf}")
+  done
+  SIM_VDEVINIT="$(IFS=,; echo "${entries[*]}")"
+
+  local disks=$(( SIM_SHELVES * SIM_DISKS_PER_SHELF ))
+  SIM_NEEDED_MB=$(( disks * SIM_DISK_GB * 1024 * (100 + SIM_DISK_MARGIN_PCT) / 100 ))
+}
+
+validate_sim_disk_config
+
+# One-line description of the sim disk setting (startup summary, VM description)
+sim_disk_summary() {
+  if [[ -z "$SIM_VDEVINIT" ]]; then
+    echo "OVA default"
+  else
+    echo "type ${SIM_DISK_TYPE} (~${SIM_DISK_GB} GB) x ${SIM_DISKS_PER_SHELF} x ${SIM_SHELVES} shelves = $(( SIM_DISKS_PER_SHELF * SIM_SHELVES )) disks, vdevinit=${SIM_VDEVINIT}"
+  fi
+}
+
+print_sim_disk_info() {
+  echo ""
+  echo "Simulated disks (per ONTAP node):"
+  if [[ -z "$SIM_VDEVINIT" ]]; then
+    echo "  SIM_DISK_TYPE not set: OVA default (28 x 1 GB), /env/env is not changed"
+    return 0
+  fi
+  local total=$(( SIM_DISKS_PER_SHELF * SIM_SHELVES ))
+  echo "  disk type             : ${SIM_DISK_TYPE} (nominal ~${SIM_DISK_GB} GB per disk)"
+  echo "  layout                : ${SIM_SHELVES} shelves x ${SIM_DISKS_PER_SHELF} disks = ${total} disks (~$(( total * SIM_DISK_GB )) GB raw)"
+  echo "  /env/env (both nodes) : setenv bootarg.vm.sim.vdevinit \"${SIM_VDEVINIT}\""
+  echo "                          setenv bootarg.sim.vdevinit \"${SIM_VDEVINIT}\""
+  echo "  needed on sim disk    : $(( SIM_NEEDED_MB / 1024 )) GB (incl. ${SIM_DISK_MARGIN_PCT}% margin); checked against ide3 at deploy time"
+}
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "ERROR: required command missing: $1" >&2; exit 1; }
@@ -829,12 +951,52 @@ prepare_vmdks_on_node() {
   echo "[node $target_node] VMDK order: ${_out_disks[*]}"
 }
 
+# Capacity check for SIM_DISK_TYPE. Runs ONCE, right after the OVA has been
+# extracted and before the first VM is created or any disk is imported: the OVA
+# (and so the sim disk) is identical for both nodes, and the script must never
+# stop after node 1 has been built.
+# The simulated disks live as files on the 4th OVA disk (ide3, "sim disk"). That
+# disk is NOT resized: the OVA ships it already partitioned/formatted, and
+# qm resize only grows the block device, not the filesystem on it (see README
+# "Simulated disks"). When the layout does not fit, stop and say what does fit.
+check_sim_disk_capacity() {
+  local target_node="$1"
+  local simdisk="$2"   # 4th extracted VMDK on target_node
+
+  [[ -z "$SIM_VDEVINIT" ]] && return 0
+
+  local bytes avail_mb usable_mb per_disk_mb max_disks
+  bytes=$(run_on_node "$target_node" qemu-img info --output=json "$simdisk" 2>/dev/null \
+    | python3 -c 'import sys, json; print(json.load(sys.stdin)["virtual-size"])' 2>/dev/null || true)
+  if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: cannot read the size of the sim disk $simdisk on $target_node (qemu-img info)" >&2
+    exit 1
+  fi
+  avail_mb=$(( bytes / 1048576 ))
+  per_disk_mb=$(( SIM_DISK_GB * 1024 ))
+  usable_mb=$(( avail_mb * 100 / (100 + SIM_DISK_MARGIN_PCT) ))
+  max_disks=$(( usable_mb / per_disk_mb ))
+
+  echo "[sim-disk] Sim disk (ide3): $(( avail_mb / 1024 )) GB; needed for ${SIM_VDEVINIT}: $(( SIM_NEEDED_MB / 1024 )) GB (incl. ${SIM_DISK_MARGIN_PCT}% margin)"
+  if (( SIM_NEEDED_MB > avail_mb )); then
+    echo "ERROR: simulated disk layout does not fit on the sim disk. No VM has been created." >&2
+    echo "  Requested : $(( SIM_SHELVES * SIM_DISKS_PER_SHELF )) disks of type ${SIM_DISK_TYPE} (~${SIM_DISK_GB} GB) = $(( SIM_NEEDED_MB / 1024 )) GB incl. ${SIM_DISK_MARGIN_PCT}% margin" >&2
+    echo "  Sim disk  : $(( avail_mb / 1024 )) GB" >&2
+    echo "  Maximum   : ${max_disks} disks of type ${SIM_DISK_TYPE} (max 56 in total: 4 shelves x 14)" >&2
+    echo "  Fix       : lower SIM_SHELVES/SIM_DISKS_PER_SHELF, use a smaller SIM_DISK_TYPE or a lower SIM_DISK_MARGIN_PCT." >&2
+    echo "  The sim disk is not resized automatically: qm resize does not grow the filesystem on it." >&2
+    exit 1
+  fi
+}
+
 create_vm() {
   local vmid="$1"
   local name="$2"
   local target_node="$3"
   local do_inject="${4:-0}"   # optional: inject identity into VMDK before import
   # params 5 and 6: serial and sysid for inject (only used if do_inject=1)
+  # param 7: NAME of the array with the 4 extracted VMDKs of this node (see main)
+  local -n node_disks="$7"
 
   cleanup_vm_and_orphaned_disks "$vmid" "$target_node"
 
@@ -875,10 +1037,8 @@ create_vm() {
     fi
   done
 
-  # FIX: use a per-VM local array (no global NODE_DISKS anymore)
-  local -a node_disks=()
-  prepare_vmdks_on_node "$target_node" node_disks
-
+  # The VMDKs were extracted (and the sim disk checked) before the first VM
+  # was created, see main.
   echo "[VM $vmid] Import VMDKs in order 1..4 on $target_node"
   for vmdk in "${node_disks[@]}"; do
     run_on_node "$target_node" qm disk import "$vmid" "$vmdk" "$VM_STORAGE" --format "$DISK_FORMAT"
@@ -996,11 +1156,11 @@ create_vm() {
       raw_path="/mnt/pve/${disk0_cfg#*:}"
     fi
     echo "[VM $vmid] Inject identity into RAW disk: $raw_path"
-    inject_identity_to_disk "$target_node" "$raw_path" "$inject_serial" "$inject_sysid"
+    inject_identity_to_disk "$target_node" "$raw_path" "$inject_serial" "$inject_sysid" "$SIM_VDEVINIT"
   fi
 
   run_on_node "$target_node" qm set "$vmid" --boot order=ide0
-  run_on_node "$target_node" qm set "$vmid" --description "NetApp ONTAP Simulator 9.16.1 two-node lab; ${NUM_NET_PORTS} ports; cluster=${CLUSTER_BRIDGE}/vlan ${CLUSTER_VLAN_TAG}, cifs=${CIFS_BRIDGE}/vlan ${CIFS_VLAN_TAG}, data=${DATA_BRIDGE}/vlan ${DATA_VLAN_TAG}; script v${SCRIPT_VERSION}; host=${target_node}"
+  run_on_node "$target_node" qm set "$vmid" --description "NetApp ONTAP Simulator 9.16.1 two-node lab; ${NUM_NET_PORTS} ports; cluster=${CLUSTER_BRIDGE}/vlan ${CLUSTER_VLAN_TAG}, cifs=${CIFS_BRIDGE}/vlan ${CIFS_VLAN_TAG}, data=${DATA_BRIDGE}/vlan ${DATA_VLAN_TAG}; sim disks=$(sim_disk_summary); script v${SCRIPT_VERSION}; host=${target_node}"
 
   echo "[VM $vmid] Final disk/boot config on $target_node:"
   run_on_node "$target_node" qm config "$vmid" | grep -E '^(boot|ide|sata|scsi|serial|vga):' || true
@@ -1042,8 +1202,10 @@ inject_identity_to_disk() {
   local raw_disk="$2"    # full path to imported RAW disk on target_node
   local serial="$3"
   local sysid="$4"
+  local vdevinit="${5:-}"   # optional: simulated disk layout, empty = leave untouched
 
   echo "[inject] SYS_SERIAL_NUM=$serial SYSID=$sysid -> $raw_disk on $target_node"
+  [[ -n "$vdevinit" ]] && echo "[inject] vdevinit=$vdevinit (bootarg.vm.sim.vdevinit + bootarg.sim.vdevinit)"
 
   local inject_script='
 set -euo pipefail
@@ -1072,6 +1234,13 @@ printf "%s\n" "$EXISTING" \
   | sed "/^[[:space:]]*$/d" > "$TMPFILE"
 printf "setenv SYS_SERIAL_NUM \"%s\"\n" "$INJ_SERIAL" >> "$TMPFILE"
 printf "setenv bootarg.nvram.sysid \"%s\"\n" "$INJ_SYSID" >> "$TMPFILE"
+if [ -n "$INJ_VDEVINIT" ]; then
+  # Replace earlier vdevinit lines (re-run), then write both variables
+  grep -v -E "^[[:space:]]*setenv[[:space:]]+bootarg\.(vm\.)?sim\.vdevinit[[:space:]]" "$TMPFILE" > "$TMPFILE.new" || true
+  mv "$TMPFILE.new" "$TMPFILE"
+  printf "setenv bootarg.vm.sim.vdevinit \"%s\"\n" "$INJ_VDEVINIT" >> "$TMPFILE"
+  printf "setenv bootarg.sim.vdevinit \"%s\"\n" "$INJ_VDEVINIT" >> "$TMPFILE"
+fi
 
 echo "[inject] New /env/env:"
 cat "$TMPFILE" | sed "s/^/  /"
@@ -1092,6 +1261,19 @@ else
   exit 1
 fi
 
+if [ -n "$INJ_VDEVINIT" ]; then
+  for VAR in bootarg.vm.sim.vdevinit bootarg.sim.vdevinit; do
+    if echo "$VERIFY" | grep -Fxq "setenv $VAR \"$INJ_VDEVINIT\""; then
+      echo "[inject] Verification successful: $VAR=$INJ_VDEVINIT"
+    else
+      echo "ERROR: verification failed: $VAR=$INJ_VDEVINIT not found in $ENV_PATH" >&2
+      echo "$VERIFY" | sed "s/^/  /" >&2
+      rm -f "$TMPFILE"
+      exit 1
+    fi
+  done
+fi
+
 rm -f "$TMPFILE"
 echo "[inject] Fully successful"
 '
@@ -1103,13 +1285,14 @@ echo "[inject] Fully successful"
   if [[ "${target_node,,}" == "${_sh,,}" || "${target_node,,}" == "${_lh,,}" ]]; then
     echo "[inject] Local execution on $(hostname -s)"
     INJ_DISK="$raw_disk" INJ_SERIAL="$serial" INJ_SYSID="$sysid" \
-      INJ_WORKDIR="$WORKDIR" bash <<< "$inject_script"
+      INJ_VDEVINIT="$vdevinit" INJ_WORKDIR="$WORKDIR" bash <<< "$inject_script"
   else
     echo "[inject] Remote execution on $target_node via SSH"
     ssh $SSH_OPTS "$target_node" bash -s << INJECT_EOF
 export INJ_DISK='$raw_disk'
 export INJ_SERIAL='$serial'
 export INJ_SYSID='$sysid'
+export INJ_VDEVINIT='$vdevinit'
 export INJ_WORKDIR='$WORKDIR'
 $inject_script
 INJECT_EOF
@@ -1247,6 +1430,7 @@ if (( SHOW_PORTS == 1 )); then
   validate_num_ports
   echo "[start] $(basename "$0") v${SCRIPT_VERSION} — network plan only (--show-ports), nothing is changed"
   print_port_info
+  print_sim_disk_info
   exit 0
 fi
 
@@ -1267,6 +1451,7 @@ cat <<STARTINFO
   CIFS_BRIDGE      = ${CIFS_BRIDGE}
   CIFS_VLAN_TAG    = ${CIFS_VLAN_TAG}
   NUM_NET_PORTS    = ${NUM_NET_PORTS}
+  SIM DISKS        = $(sim_disk_summary)
 STARTINFO
 
 validate_num_ports
@@ -1291,10 +1476,21 @@ cat <<INFO
 - Node2 SYS_SERIAL_NUM:   $NODE2_SYS_SERIAL_NUM
 - Node2 SYSID:            $NODE2_SYSID
 - EXPECT_TIMEOUT:         $EXPECT_TIMEOUT s
+- Sim disks:              $(sim_disk_summary)
 INFO
 
-create_vm "$VMID1" "$VMNAME1" "$TARGET_NODE1" "${AUTOMATE_NODE2_SYSID}" "$NODE1_SYS_SERIAL_NUM" "$NODE1_SYSID"
-create_vm "$VMID2" "$VMNAME2" "$TARGET_NODE2" "${AUTOMATE_NODE2_SYSID}" "$NODE2_SYS_SERIAL_NUM" "$NODE2_SYSID"
+# Extract the OVA on both nodes first, then check the sim disk ONCE (the OVA is
+# the same for both nodes). Only after this the first VM is created, so a failure
+# here never leaves a half-built cluster behind.
+# NODEn_VMDKS are read through a nameref inside create_vm (shellcheck cannot see that)
+# shellcheck disable=SC2034
+declare -a NODE1_VMDKS=() NODE2_VMDKS=()
+prepare_vmdks_on_node "$TARGET_NODE1" NODE1_VMDKS
+prepare_vmdks_on_node "$TARGET_NODE2" NODE2_VMDKS
+check_sim_disk_capacity "$TARGET_NODE1" "${NODE1_VMDKS[3]}"
+
+create_vm "$VMID1" "$VMNAME1" "$TARGET_NODE1" "${AUTOMATE_NODE2_SYSID}" "$NODE1_SYS_SERIAL_NUM" "$NODE1_SYSID" NODE1_VMDKS
+create_vm "$VMID2" "$VMNAME2" "$TARGET_NODE2" "${AUTOMATE_NODE2_SYSID}" "$NODE2_SYS_SERIAL_NUM" "$NODE2_SYSID" NODE2_VMDKS
 
 cat <<POST
 
@@ -1323,3 +1519,5 @@ cat <<POST
 POST
 
 print_port_info
+
+print_sim_disk_info
