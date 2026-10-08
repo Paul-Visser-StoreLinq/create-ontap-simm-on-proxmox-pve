@@ -1,0 +1,5 @@
+# Local, site-specific configs (copy ontap-sim-2node-proxmox.conf to create one)
+ontap-sim-2node-*-cluster*.conf
+
+# License data
+license add SIMM clusters.txt

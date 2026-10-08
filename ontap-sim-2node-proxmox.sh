@@ -9,6 +9,9 @@
 # ---------------
 # Format: v{MAJOR}.{MINOR}  {DD-MM-YYYY}  {Description}
 #
+# The version lives in SCRIPT_VERSION below (single source of truth) — keep it
+# in sync with the latest entry here. It is not part of the filename.
+#
 # MAJOR increments on major functional changes (new approach, different behavior)
 # MINOR increments on bugfixes, minor improvements or adjustments
 # Date is the actual date the change was made
@@ -53,6 +56,14 @@
 #                   verbinding naar nodes die nog niet in known_hosts staan
 # v2.9  29-04-2026  CIFS_BRIDGE/CIFS_VLAN_TAG toegevoegd; CIFS-poorten krijgen
 #                   eigen bridge (vmbr0), cluster/nfs/iscsi blijven op DATA_BRIDGE
+# v3.0  08-10-2026  Cluster interconnect (net0/net1) op eigen CLUSTER_BRIDGE/
+#                   CLUSTER_VLAN_TAG (verplicht, geen default); DATA_* alleen
+#                   nog voor NFS/iSCSI; CIFS_* default nu DATA_* (was vmbr0).
+#                   Startup-validatie cluster != data. Versie via SCRIPT_VERSION
+#                   (niet meer in bestandsnaam); --version en --show-ports.
+#                   require_proxmox_host(): duidelijke melding als het script
+#                   niet op een Proxmox-host draait.
+#                   NIET compatibel met v2.x configs: CLUSTER_VLAN_TAG vereist.
 # =============================================================================
 #
 # DESCRIPTION
@@ -110,7 +121,8 @@
 # Available settings in the config file:
 #   - Storage: VM_STORAGE, OVA_STORAGE_ID, OVA_DIR, OVA_NAME
 #   - Nodes: TARGET_NODE1, TARGET_NODE2, VMID1, VMID2
-#   - Network: DATA_BRIDGE, DATA_VLAN_TAG, NUM_NET_PORTS
+#   - Network: CLUSTER_BRIDGE, CLUSTER_VLAN_TAG (required), DATA_BRIDGE,
+#              DATA_VLAN_TAG, CIFS_BRIDGE, CIFS_VLAN_TAG, NUM_NET_PORTS
 #   - Hardware: CORES, SOCKETS, MEMORY_MB, CPU_TYPE, NET_MODEL
 #   - ONTAP: NODE1_SYS_SERIAL_NUM, NODE1_SYSID, NODE2_SYS_SERIAL_NUM, NODE2_SYSID
 #   - Runtime: WORKDIR, EXPECT_TIMEOUT, DISK_FORMAT
@@ -155,8 +167,14 @@
 
 set -euo pipefail
 
+# Single source of truth for the script version. Update together with the
+# VERSION HISTORY above, README and CHANGELOG.
+SCRIPT_VERSION="3.0"
+
 # Default config file location
 CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
+
+SHOW_PORTS=0
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -165,13 +183,25 @@ while [[ $# -gt 0 ]]; do
       CONFIG_FILE="$2"
       shift 2
       ;;
+    --version|-V)
+      echo "$(basename "$0") v${SCRIPT_VERSION}"
+      exit 0
+      ;;
+    --show-ports)
+      SHOW_PORTS=1
+      shift
+      ;;
     --help|-h)
       cat <<HELP
+$(basename "$0") v${SCRIPT_VERSION}
 Usage: $(basename "$0") [OPTIONS]
 
 Options:
   --config FILE    Path to configuration file
                    Default: ./ontap-sim-2node-proxmox.conf
+  --show-ports     Validate the network config, print the port mapping
+                   (bridge/VLAN per port) and exit; changes nothing
+  --version        Show script version
   --help           Show this help message
 
 Configuration:
@@ -216,10 +246,16 @@ VMID1="${VMID1:-auto}"
 VMID2="${VMID2:-auto}"
 TARGET_NODE1="${TARGET_NODE1:-pve01}"
 TARGET_NODE2="${TARGET_NODE2:-pve02}"
+# Cluster interconnect (net0/net1). CLUSTER_VLAN_TAG has no default: it must be
+# set explicitly (0 = untagged) so cluster and data traffic are never mixed by accident.
+CLUSTER_BRIDGE="${CLUSTER_BRIDGE:-vmbr1}"
+CLUSTER_VLAN_TAG="${CLUSTER_VLAN_TAG:-}"
+# Data ports (NFS, iSCSI)
 DATA_BRIDGE="${DATA_BRIDGE:-vmbr1}"
 DATA_VLAN_TAG="${DATA_VLAN_TAG:-20}"
-CIFS_BRIDGE="${CIFS_BRIDGE:-vmbr0}"
-CIFS_VLAN_TAG="${CIFS_VLAN_TAG:-0}"
+# CIFS ports: optional override, defaults to the data network
+CIFS_BRIDGE="${CIFS_BRIDGE:-$DATA_BRIDGE}"
+CIFS_VLAN_TAG="${CIFS_VLAN_TAG:-$DATA_VLAN_TAG}"
 NUM_NET_PORTS="${NUM_NET_PORTS:-8}"
 CORES="${CORES:-2}"
 SOCKETS="${SOCKETS:-1}"
@@ -242,6 +278,33 @@ VMNAME1=""
 VMNAME2=""
 
 # ---------- Helpers ----------
+
+# Runs before anything touches Proxmox: cluster and data traffic must be
+# separated, otherwise everything ends up in one L2 domain again.
+validate_network_config() {
+  local var
+  if [[ -z "$CLUSTER_VLAN_TAG" ]]; then
+    echo "ERROR: CLUSTER_VLAN_TAG is not set." >&2
+    echo "  The cluster interconnect (net0/net1) needs its own VLAN; there is no default." >&2
+    echo "  Set CLUSTER_VLAN_TAG in the config file (0 = untagged) according to the" >&2
+    echo "  StoreLinq network VLAN plan." >&2
+    exit 1
+  fi
+  for var in CLUSTER_VLAN_TAG DATA_VLAN_TAG CIFS_VLAN_TAG; do
+    if ! [[ "${!var}" =~ ^[0-9]+$ ]] || (( 10#${!var} > 4094 )); then
+      echo "ERROR: $var must be an integer between 0 and 4094 (value: '${!var}')" >&2
+      exit 1
+    fi
+  done
+  if [[ "$CLUSTER_BRIDGE" == "$DATA_BRIDGE" ]] && (( 10#$CLUSTER_VLAN_TAG == 10#$DATA_VLAN_TAG )); then
+    echo "ERROR: cluster and data network are identical (bridge '$CLUSTER_BRIDGE', VLAN tag '$CLUSTER_VLAN_TAG')." >&2
+    echo "  Cluster interconnect and NFS/iSCSI data would share one L2 domain." >&2
+    echo "  Use a different CLUSTER_BRIDGE or CLUSTER_VLAN_TAG (or DATA_*)." >&2
+    exit 1
+  fi
+}
+
+validate_network_config
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "ERROR: required command missing: $1" >&2; exit 1; }
@@ -280,14 +343,17 @@ EOF
   exit 1
 }
 
-require_proxmox_host
+# --show-ports only prints the plan and must work anywhere (also off-Proxmox)
+if (( SHOW_PORTS == 0 )); then
+  require_proxmox_host
 
-for cmd in qm tar awk sed grep find timeout pvesh pvesm hostname ssh python3; do
-  require_cmd "$cmd"
-done
+  for cmd in qm tar awk sed grep find timeout pvesh pvesm hostname ssh python3; do
+    require_cmd "$cmd"
+  done
 
-mkdir -p "$WORKDIR"
-cd "$WORKDIR"
+  mkdir -p "$WORKDIR"
+  cd "$WORKDIR"
+fi
 
 run_on_node() {
   local node="$1"
@@ -659,7 +725,7 @@ print_port_info() {
   printf "  %-7s  %-5s  %-22s  %s\n" "-------" "-----" "----" "------"
   for (( i=0; i<2; i++ )); do
     printf "  net%-4d e0%-4s %-22s  %s vlan %s\n" \
-      "$i" "${letters:$i:1}" "cluster interconnect" "$DATA_BRIDGE" "$DATA_VLAN_TAG"
+      "$i" "${letters:$i:1}" "cluster interconnect" "$CLUSTER_BRIDGE" "$CLUSTER_VLAN_TAG"
   done
   for (( i=0; i<ports_per_proto; i++ )); do
     netid=$(( 2 + i ))
@@ -797,11 +863,14 @@ create_vm() {
   local _ports_per_proto=$(( (NUM_NET_PORTS - 2) / 3 ))
   local _cifs_end=$(( 2 + _ports_per_proto ))
   for (( _p=0; _p<NUM_NET_PORTS; _p++ )); do
-    if (( _p >= 2 && _p < _cifs_end )); then
-      # cifs-poorten → CIFS_BRIDGE
+    if (( _p < 2 )); then
+      # cluster interconnect (0,1) → CLUSTER_BRIDGE
+      run_on_node "$target_node" qm set "$vmid" "--net${_p}" "$(format_nic "$CLUSTER_BRIDGE" "$CLUSTER_VLAN_TAG")"
+    elif (( _p < _cifs_end )); then
+      # cifs-poorten → CIFS_BRIDGE (default: DATA_BRIDGE)
       run_on_node "$target_node" qm set "$vmid" "--net${_p}" "$(format_nic "$CIFS_BRIDGE" "$CIFS_VLAN_TAG")"
     else
-      # cluster (0,1) + nfs + iscsi → DATA_BRIDGE
+      # nfs + iscsi → DATA_BRIDGE
       run_on_node "$target_node" qm set "$vmid" "--net${_p}" "$(format_nic "$DATA_BRIDGE" "$DATA_VLAN_TAG")"
     fi
   done
@@ -931,7 +1000,7 @@ create_vm() {
   fi
 
   run_on_node "$target_node" qm set "$vmid" --boot order=ide0
-  run_on_node "$target_node" qm set "$vmid" --description "NetApp ONTAP Simulator 9.16.1 two-node lab; ${NUM_NET_PORTS} ports op ${DATA_BRIDGE} (vlan ${DATA_VLAN_TAG}); host=${target_node}"
+  run_on_node "$target_node" qm set "$vmid" --description "NetApp ONTAP Simulator 9.16.1 two-node lab; ${NUM_NET_PORTS} ports; cluster=${CLUSTER_BRIDGE}/vlan ${CLUSTER_VLAN_TAG}, cifs=${CIFS_BRIDGE}/vlan ${CIFS_VLAN_TAG}, data=${DATA_BRIDGE}/vlan ${DATA_VLAN_TAG}; script v${SCRIPT_VERSION}; host=${target_node}"
 
   echo "[VM $vmid] Final disk/boot config on $target_node:"
   run_on_node "$target_node" qm config "$vmid" | grep -E '^(boot|ide|sata|scsi|serial|vga):' || true
@@ -1174,7 +1243,15 @@ EXPEOF
 
 # Show all effective settings at startup, so environment variables
 # that are accidentally exported are immediately visible.
+if (( SHOW_PORTS == 1 )); then
+  validate_num_ports
+  echo "[start] $(basename "$0") v${SCRIPT_VERSION} — network plan only (--show-ports), nothing is changed"
+  print_port_info
+  exit 0
+fi
+
 cat <<STARTINFO
+[start] $(basename "$0") v${SCRIPT_VERSION}
 [start] Effective configuration (including any environment variables):
   CLUSTER_PREFIX   = ${CLUSTER_PREFIX}
   CLUSTER_NUM      = ${CLUSTER_NUM}
@@ -1183,6 +1260,8 @@ cat <<STARTINFO
   VM_STORAGE       = ${VM_STORAGE}
   VMID1            = ${VMID1}
   VMID2            = ${VMID2}
+  CLUSTER_BRIDGE   = ${CLUSTER_BRIDGE}
+  CLUSTER_VLAN_TAG = ${CLUSTER_VLAN_TAG}
   DATA_BRIDGE      = ${DATA_BRIDGE}
   DATA_VLAN_TAG    = ${DATA_VLAN_TAG}
   CIFS_BRIDGE      = ${CIFS_BRIDGE}

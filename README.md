@@ -90,10 +90,27 @@ All settings can be passed as environment variables. The values below are the de
 
 | Variable | Default | Description |
 |---|---|---|
-| `MGMT_BRIDGE` | `vmbr0` | Bridge for management network (net2) |
-| `DATA_BRIDGE` | `vmbr1` | Bridge for data/cluster network (net0, net1, net3) |
-| `MGMT_VLAN_TAG` | `0` | VLAN tag for management (0 = untagged) |
-| `DATA_VLAN_TAG` | `20` | VLAN tag for data network |
+| `CLUSTER_BRIDGE` | `vmbr1` | Bridge for the cluster interconnect (net0, net1) |
+| `CLUSTER_VLAN_TAG` | *(none, required)* | VLAN tag for the cluster interconnect (`0` = untagged). Script aborts if empty |
+| `DATA_BRIDGE` | `vmbr1` | Bridge for data ports (NFS, iSCSI) |
+| `DATA_VLAN_TAG` | `20` | VLAN tag for data ports |
+| `CIFS_BRIDGE` | `DATA_BRIDGE` | Optional override: bridge for CIFS ports |
+| `CIFS_VLAN_TAG` | `DATA_VLAN_TAG` | Optional override: VLAN tag for CIFS ports |
+
+The script aborts at startup if cluster and data use the same bridge **and** the same VLAN tag (including `0`/`0`), since everything would then share one L2 domain.
+
+Use `./ontap-sim-2node-proxmox.sh --show-ports` to print the resulting bridge/VLAN per port without changing anything (works on any machine). `--version` shows the script version.
+
+### Local configs
+
+`ontap-sim-2node-proxmox.conf` is the only example config in the repo. Copy it to your own local config and pass it with `--config`:
+
+```bash
+cp ontap-sim-2node-proxmox.conf ontap-sim-2node-lab-cluster1.conf
+./ontap-sim-2node-proxmox.sh --config ontap-sim-2node-lab-cluster1.conf
+```
+
+Files matching `ontap-sim-2node-*-cluster*.conf` are git-ignored so site-specific values and license data are never committed.
 
 ### VM hardware
 
@@ -178,6 +195,7 @@ Then follow the standard ONTAP cluster setup wizard on node1 and join node2 via 
 | v2.4 | 17-04-2026 | Fixed inject path passing; added explicit debug logging for inject path |
 | v2.5 | 17-04-2026 | Moved inject from VMDK to imported RAW disk; guestfish upload on RAW works reliably |
 | v2.6 | 17-04-2026 | Set fixed ONTAP Simulator license serials: node1=`4082368-50-7`, node2=`4034389-06-2` |
+| v3.0 | 08-10-2026 | Cluster interconnect on separate `CLUSTER_BRIDGE`/`CLUSTER_VLAN_TAG` (required); CIFS defaults to data network; version no longer in filename; `--version`, `--show-ports` |
 
 ---
 

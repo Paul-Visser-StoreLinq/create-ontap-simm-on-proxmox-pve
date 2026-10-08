@@ -5,6 +5,33 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.0] – 2026-10-08
+
+> **Breaking:** configs written for v2.x are not compatible. `CLUSTER_VLAN_TAG` is now required; the script stops with an error if it is empty.
+
+### Added
+- `CLUSTER_BRIDGE` (default `vmbr1`) and `CLUSTER_VLAN_TAG` (**required**, no default) for the cluster interconnect (`net0`, `net1`).
+- Startup validation (before anything happens on Proxmox): aborts if `CLUSTER_VLAN_TAG` is empty, if a VLAN tag is not an integer 0–4094, or if cluster and data use the same bridge and the same VLAN tag (including `0`/`0`).
+- `SCRIPT_VERSION` variable at the top of the script as the single source of truth for the version; shown in `--help`, the startup summary and the VM description.
+- `--version` option.
+- `require_proxmox_host()`: stops with a clear message when the script is not run on a Proxmox VE host (`qm`/`pvesh`/`pvesm` missing).
+- `--show-ports` option: validates the network config and prints the bridge/VLAN per port, without touching Proxmox (also works off-Proxmox).
+- Startup summary and VM description now include `CLUSTER_BRIDGE` / `CLUSTER_VLAN_TAG`.
+
+### Changed
+- **Version number is no longer part of the filename.** The script is now `ontap-sim-2node-proxmox.sh` (was `ontap-sim-2node-proxmox-vX.Y.sh`). This supersedes the v2.7 note "Script version number included in filename going forward".
+- `DATA_BRIDGE` / `DATA_VLAN_TAG` now apply only to the data ports (NFS, iSCSI).
+- **Behaviour change:** `CIFS_BRIDGE` / `CIFS_VLAN_TAG` now default to `DATA_BRIDGE` / `DATA_VLAN_TAG` (previously `vmbr0`, untagged). They remain available as an optional override. If you relied on CIFS ending up on `vmbr0`, set `CIFS_BRIDGE="vmbr0"` and `CIFS_VLAN_TAG="0"` explicitly.
+- Port mapping and `print_port_info()` show the correct bridge/VLAN per port group: `net0`/`net1` cluster, then CIFS, NFS, iSCSI.
+- All `.conf` files: Network Configuration section extended with `CLUSTER_*` and commented-out `CIFS_*` overrides; header no longer refers to a versioned script name. `CLUSTER_VLAN_TAG` is left empty and must be filled in per the StoreLinq network VLAN plan.
+
+### Upgrading from v2.x
+1. Use `ontap-sim-2node-proxmox.sh` (the old versioned file is gone).
+2. Set `CLUSTER_VLAN_TAG` (and optionally `CLUSTER_BRIDGE`) in your config, different from the data network.
+3. Set `CIFS_BRIDGE` / `CIFS_VLAN_TAG` explicitly if CIFS should stay on a different network than NFS/iSCSI.
+
+---
+
 ## [v2.9] – 2026-04-29
 
 ### Added
@@ -51,7 +78,6 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `DATA_BRIDGE` and `DATA_VLAN_TAG` are now the primary (only) bridge variables in this version.
 - OVA readability precheck now uses the Proxmox storage content API as primary method; SSH `test -r` as fallback. Provides actionable error output if both fail.
 - Startup summary now includes `DATA_BRIDGE`, `DATA_VLAN_TAG`, and `NUM_NET_PORTS`.
-- Script version number included in filename going forward (`ontap-sim-2node-proxmox-vX.Y.sh`).
 
 ---
 
@@ -98,7 +124,7 @@ Change `NUM_NET_PORTS` in the config for a different port count (valid: 5, 8, 11
 
 ### Upgrading from v2.6
 
-1. Replace the script with `ontap-sim-2node-proxmox-v2.9.sh`.
+1. Replace the script with the v2.9 release (filename at that time: `ontap-sim-2node-proxmox-v2.9.sh`; from v3.0 the name is unversioned).
 2. Update `ontap-sim-2node-proxmox.conf` — add the new variables or use the updated default config:
    ```ini
    CIFS_BRIDGE="vmbr0"
