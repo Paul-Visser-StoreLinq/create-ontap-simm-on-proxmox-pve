@@ -104,6 +104,25 @@
 #                   makes, with the theoretical maximum behind it "(max 25)".
 #                   Was an unequal layout such as "1 x 14 + 1 x 11" that the
 #                   config cannot express.
+# v3.3  02-11-2026  Fix: NICs on the wrong bridge (VM 100: interconnect on vmbr0,
+#                   mgmt/data on vmbr1). Bridges and VLANs now live in ONE
+#                   block (defaults below, same names in the config) with a
+#                   comment per bridge; defaults follow the StoreLinq design:
+#                   DATA_BRIDGE=vmbr0 / DATA_VLAN_TAG=50 (was vmbr1 / 20).
+#                   New trunk port: TRUNK_PORT (default net5 = e0f) on
+#                   TRUNK_BRIDGE (vmbr1) with TRUNK_VLANS ("100;101;102");
+#                   TRUNK_PORT=none switches it off. One function decides the
+#                   NIC per port (nic_spec_for_port), used by create_vm,
+#                   --show-ports and --dry-run, so plan and deploy cannot differ.
+#                   Precheck check_bridge_vlans: per target node, every bridge
+#                   must exist and be VLAN-aware, and every VLAN used (cluster,
+#                   data, cifs, trunk) must be in its bridge-vids (Proxmox API,
+#                   /nodes/<node>/network/<bridge>); stops before anything is
+#                   created. CHECK_BRIDGE_VLANS=0 skips it (not recommended).
+#                   New --dry-run: all prechecks plus the exact qm set --netN
+#                   commands per node; creates nothing. --show-ports also
+#                   prints those commands. Cluster VLAN inside the trunk VLANs
+#                   on the same bridge is refused.
 # =============================================================================
 #
 # DESCRIPTION
@@ -170,7 +189,8 @@
 #   - Storage: VM_STORAGE, OVA_STORAGE_ID, OVA_DIR, OVA_NAME
 #   - Nodes: TARGET_NODE1, TARGET_NODE2, VMID1, VMID2
 #   - Network: CLUSTER_BRIDGE, CLUSTER_VLAN_TAG (required), DATA_BRIDGE,
-#              DATA_VLAN_TAG, CIFS_BRIDGE, CIFS_VLAN_TAG, NUM_NET_PORTS
+#              DATA_VLAN_TAG, CIFS_BRIDGE, CIFS_VLAN_TAG, TRUNK_PORT,
+#              TRUNK_BRIDGE, TRUNK_VLANS, CHECK_BRIDGE_VLANS, NUM_NET_PORTS
 #   - Hardware: CORES, SOCKETS, MEMORY_MB, CPU_TYPE, NET_MODEL
 #   - ONTAP: NODE1_SYS_SERIAL_NUM, NODE1_SYSID, NODE2_SYS_SERIAL_NUM, NODE2_SYSID
 #   - Sim disks (optional): SIM_DISK_TYPE, SIM_DISKS_PER_SHELF, SIM_SHELVES,
@@ -219,13 +239,14 @@ set -euo pipefail
 
 # Single source of truth for the script version. Update together with the
 # VERSION HISTORY above, README and CHANGELOG.
-SCRIPT_VERSION="3.2.1"
+SCRIPT_VERSION="3.3"
 
 # Default config file location
 CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
 
 SHOW_PORTS=0
 SHOW_SIM_DISK=0
+DRY_RUN=0
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -246,6 +267,10 @@ while [[ $# -gt 0 ]]; do
       SHOW_SIM_DISK=1
       shift
       ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
     --help|-h)
       cat <<HELP
 $(basename "$0") v${SCRIPT_VERSION}
@@ -255,7 +280,12 @@ Options:
   --config FILE    Path to configuration file
                    Default: ./ontap-sim-2node-proxmox.conf
   --show-ports     Validate the network config, print the port mapping
-                   (bridge/VLAN per port) and exit; changes nothing
+                   (bridge/VLAN per port) and the qm set --netN commands,
+                   and exit; changes nothing, works on any machine
+  --dry-run        On a Proxmox host: run all prechecks (API, storage, OVA,
+                   bridges and VLANs in bridge-vids on both nodes, VMIDs)
+                   and print the exact qm set --netN commands per node;
+                   creates nothing
   --show-sim-disk  Extract the OVA on TARGET_NODE1 (or reuse an extracted
                    directory), read the size of the sim disk and print per
                    disk type how many simulated disks fit, plus whether the
@@ -285,8 +315,8 @@ HELP
   esac
 done
 
-if (( SHOW_PORTS == 1 && SHOW_SIM_DISK == 1 )); then
-  echo "ERROR: use either --show-ports or --show-sim-disk, not both" >&2
+if (( SHOW_PORTS + SHOW_SIM_DISK + DRY_RUN > 1 )); then
+  echo "ERROR: use only one of --show-ports, --show-sim-disk and --dry-run" >&2
   exit 1
 fi
 
@@ -326,16 +356,37 @@ VMID1="${VMID1:-auto}"
 VMID2="${VMID2:-auto}"
 TARGET_NODE1="${TARGET_NODE1:-pve01}"
 TARGET_NODE2="${TARGET_NODE2:-pve02}"
+# ---------- Network: bridges and VLANs (the ONLY place; the config uses the same names) ----------
+# Which bridge is which network (StoreLinq design, HLD/LLD §7.2; check on the node
+# with: pvesh get /nodes/<node>/network/<bridge>):
+#   vmbr0 = 1 Gb (nic1), VLAN-aware, bridge-vids incl. 50: lab mgmt + data (VLAN 50)
+#   vmbr1 = 10 Gb (nic0), VLAN-aware, bridge-vids incl. 51/52/53 and 100-102:
+#           cluster interconnect per cluster (lab-clusterN -> VLAN 5N, L2 only)
+#           and the lab SnapMirror/klant VLANs 100;101;102 (trunk on e0f)
+# Port -> network (8 ports):
+#   net0, net1           e0a, e0b  cluster interconnect  CLUSTER_BRIDGE / CLUSTER_VLAN_TAG
+#   net2-net4, net6-net7 e0c-e0e, e0g, e0h  mgmt/data   DATA_BRIDGE (CIFS_* for the cifs group)
+#   net5                 e0f       trunk                 TRUNK_BRIDGE / TRUNK_VLANS
+#
 # Cluster interconnect (net0/net1). CLUSTER_VLAN_TAG has no default: it must be
 # set explicitly (0 = untagged) so cluster and data traffic are never mixed by accident.
 CLUSTER_BRIDGE="${CLUSTER_BRIDGE:-vmbr1}"
 CLUSTER_VLAN_TAG="${CLUSTER_VLAN_TAG:-}"
-# Data ports (NFS, iSCSI)
-DATA_BRIDGE="${DATA_BRIDGE:-vmbr1}"
-DATA_VLAN_TAG="${DATA_VLAN_TAG:-20}"
+# Mgmt/data ports (cifs, nfs, iscsi groups): lab VLAN 50 on the 1 Gb bridge
+DATA_BRIDGE="${DATA_BRIDGE:-vmbr0}"
+DATA_VLAN_TAG="${DATA_VLAN_TAG:-50}"
 # CIFS ports: optional override, defaults to the data network
 CIFS_BRIDGE="${CIFS_BRIDGE:-$DATA_BRIDGE}"
 CIFS_VLAN_TAG="${CIFS_VLAN_TAG:-$DATA_VLAN_TAG}"
+# Trunk port: one Proxmox port (net index) that carries several tagged VLANs
+# (Proxmox "trunks=", no tag). Default net5 = e0f with VLAN 100;101;102 on vmbr1.
+# TRUNK_PORT=none (or empty in the environment AND config) switches it off.
+TRUNK_PORT="${TRUNK_PORT-5}"
+TRUNK_BRIDGE="${TRUNK_BRIDGE:-vmbr1}"
+TRUNK_VLANS="${TRUNK_VLANS:-100;101;102}"
+# 1 (default) = before anything is created, check on both nodes that every bridge
+# exists, is VLAN-aware and has every VLAN used in its bridge-vids; 0 = skip.
+CHECK_BRIDGE_VLANS="${CHECK_BRIDGE_VLANS:-1}"
 NUM_NET_PORTS="${NUM_NET_PORTS:-8}"
 CORES="${CORES:-2}"
 SOCKETS="${SOCKETS:-1}"
@@ -392,6 +443,65 @@ validate_network_config() {
     echo "  Use a different CLUSTER_BRIDGE or CLUSTER_VLAN_TAG (or DATA_*)." >&2
     exit 1
   fi
+  for var in CLUSTER_BRIDGE DATA_BRIDGE CIFS_BRIDGE TRUNK_BRIDGE; do
+    if ! [[ "${!var}" =~ ^[A-Za-z][A-Za-z0-9_.-]*$ ]]; then
+      echo "ERROR: $var is not a valid bridge name (value: '${!var}')" >&2
+      exit 1
+    fi
+  done
+  if [[ "$CHECK_BRIDGE_VLANS" != "0" && "$CHECK_BRIDGE_VLANS" != "1" ]]; then
+    echo "ERROR: CHECK_BRIDGE_VLANS must be 0 or 1 (value: '$CHECK_BRIDGE_VLANS')" >&2
+    exit 1
+  fi
+  if [[ -z "$TRUNK_PORT" || "${TRUNK_PORT,,}" == "none" ]]; then
+    TRUNK_PORT=""
+    return 0
+  fi
+  if ! [[ "$TRUNK_PORT" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: TRUNK_PORT must be a Proxmox port number (net index, e.g. 5 = e0f) or 'none' (value: '$TRUNK_PORT')" >&2
+    exit 1
+  fi
+  TRUNK_PORT=$((10#$TRUNK_PORT))
+  if (( TRUNK_PORT < 2 )); then
+    echo "ERROR: TRUNK_PORT=$TRUNK_PORT is a cluster interconnect port (net0/net1); use 2 or higher" >&2
+    exit 1
+  fi
+  if ! [[ "$TRUNK_VLANS" =~ ^[0-9]+(-[0-9]+)?(\;[0-9]+(-[0-9]+)?)*$ ]]; then
+    echo "ERROR: TRUNK_VLANS must be VLAN IDs or ranges separated by ';' (e.g. 100;101;102 or 100-102); value: '$TRUNK_VLANS'" >&2
+    exit 1
+  fi
+  local v
+  for v in $(trunk_vlan_list); do
+    if (( v < 1 || v > 4094 )); then
+      echo "ERROR: TRUNK_VLANS contains VLAN $v; allowed is 1-4094" >&2
+      exit 1
+    fi
+    if [[ "$CLUSTER_BRIDGE" == "$TRUNK_BRIDGE" ]] && (( v == 10#$CLUSTER_VLAN_TAG )); then
+      echo "ERROR: the cluster interconnect VLAN $v is also in TRUNK_VLANS on bridge '$TRUNK_BRIDGE'." >&2
+      echo "  The interconnect must be its own L2 domain; remove it from TRUNK_VLANS." >&2
+      exit 1
+    fi
+  done
+}
+
+# TRUNK_VLANS ("100;101;102" or "100-102") as a space-separated list of VLAN IDs
+trunk_vlan_list() {
+  local part a b out=()
+  local IFS=';'
+  for part in $TRUNK_VLANS; do
+    if [[ "$part" == *-* ]]; then
+      a=$((10#${part%-*})); b=$((10#${part#*-}))
+      if (( a > b || b - a > 4094 )); then
+        echo "ERROR: invalid VLAN range '$part' in TRUNK_VLANS" >&2
+        exit 1
+      fi
+      while (( a <= b )); do out+=("$a"); a=$(( a + 1 )); done
+    else
+      out+=("$((10#$part))")
+    fi
+  done
+  IFS=' '
+  echo "${out[*]}"
 }
 
 validate_network_config
@@ -599,8 +709,11 @@ if (( SHOW_PORTS == 0 )); then
     require_cmd "$cmd"
   done
 
-  mkdir -p "$WORKDIR"
-  cd "$WORKDIR"
+  # --dry-run creates nothing, not even WORKDIR
+  if (( DRY_RUN == 0 )); then
+    mkdir -p "$WORKDIR"
+    cd "$WORKDIR"
+  fi
 fi
 
 run_on_node() {
@@ -946,6 +1059,150 @@ format_nic() {
   fi
 }
 
+# Role of Proxmox port <p>: cluster | cifs | nfs | iscsi | trunk.
+# The trunk port overrides the group it would otherwise belong to.
+port_role() {
+  local p="$1"
+  local per=$(( (NUM_NET_PORTS - 2) / 3 ))
+  if (( p < 2 )); then echo cluster; return; fi
+  if [[ -n "$TRUNK_PORT" ]] && (( p == TRUNK_PORT )); then echo trunk; return; fi
+  if (( p < 2 + per )); then echo cifs
+  elif (( p < 2 + 2*per )); then echo nfs
+  else echo iscsi
+  fi
+}
+
+# The one place that decides bridge/VLAN per port. Used by create_vm, --show-ports
+# and --dry-run, so the plan and the deploy can never differ.
+nic_spec_for_port() {
+  case "$(port_role "$1")" in
+    cluster) format_nic "$CLUSTER_BRIDGE" "$CLUSTER_VLAN_TAG" ;;
+    cifs)    format_nic "$CIFS_BRIDGE" "$CIFS_VLAN_TAG" ;;
+    nfs|iscsi) format_nic "$DATA_BRIDGE" "$DATA_VLAN_TAG" ;;
+    trunk)   echo "$NET_MODEL,bridge=$TRUNK_BRIDGE,trunks=$TRUNK_VLANS" ;;
+  esac
+}
+
+# Short "bridge vlan X" / "bridge trunks X" text for the port table
+nic_desc_for_port() {
+  case "$(port_role "$1")" in
+    cluster) echo "$CLUSTER_BRIDGE vlan $CLUSTER_VLAN_TAG" ;;
+    cifs)    echo "$CIFS_BRIDGE vlan $CIFS_VLAN_TAG" ;;
+    nfs|iscsi) echo "$DATA_BRIDGE vlan $DATA_VLAN_TAG" ;;
+    trunk)   echo "$TRUNK_BRIDGE trunks $TRUNK_VLANS" ;;
+  esac
+}
+
+# Print the exact qm set commands per node (no execution)
+print_nic_commands() {
+  local vm1="${1:-$VMID1}" vm2="${2:-$VMID2}" node vmid p
+  echo ""
+  echo "qm set commands for the network interfaces (not executed here):"
+  for node in "$TARGET_NODE1" "$TARGET_NODE2"; do
+    if [[ "$node" == "$TARGET_NODE1" ]]; then vmid="$vm1"; else vmid="$vm2"; fi
+    [[ "$vmid" == "auto" ]] && vmid="<${node}-vmid:auto>"
+    echo "  # node $node"
+    for (( p=0; p<NUM_NET_PORTS; p++ )); do
+      echo "  qm set $vmid --net$p $(nic_spec_for_port "$p")"
+    done
+  done
+}
+
+# bridge -> space-separated VLANs (0 = untagged) that this deploy uses on it
+declare -A BRIDGE_VLANS_NEEDED=()
+collect_bridge_vlans() {
+  local p role v
+  BRIDGE_VLANS_NEEDED=()
+  add_need() { BRIDGE_VLANS_NEEDED[$1]="${BRIDGE_VLANS_NEEDED[$1]:-} $2"; }
+  for (( p=0; p<NUM_NET_PORTS; p++ )); do
+    role="$(port_role "$p")"
+    case "$role" in
+      cluster) add_need "$CLUSTER_BRIDGE" "$((10#$CLUSTER_VLAN_TAG))" ;;
+      cifs)    add_need "$CIFS_BRIDGE" "$((10#$CIFS_VLAN_TAG))" ;;
+      nfs|iscsi) add_need "$DATA_BRIDGE" "$((10#$DATA_VLAN_TAG))" ;;
+      trunk)   for v in $(trunk_vlan_list); do add_need "$TRUNK_BRIDGE" "$v"; done ;;
+    esac
+  done
+}
+
+# Precheck: on every target node every bridge used must exist and be VLAN-aware,
+# and every tagged VLAN used must be in its bridge-vids. Reads the node's network
+# config through the Proxmox API (pvesh get /nodes/<node>/network/<bridge>), so it
+# also works for the remote node without SSH. Stops before anything is created.
+check_bridge_vlans() {
+  if [[ "$CHECK_BRIDGE_VLANS" == "0" ]]; then
+    echo "[precheck] WARNING: CHECK_BRIDGE_VLANS=0: bridges and bridge-vids are NOT checked" >&2
+    return 0
+  fi
+  collect_bridge_vlans
+  local node bridge json result failed=0 seen=""
+  for node in "$TARGET_NODE1" "$TARGET_NODE2"; do
+    [[ " $seen " == *" ${node,,} "* ]] && continue
+    seen="$seen ${node,,}"
+    for bridge in $(printf '%s\n' "${!BRIDGE_VLANS_NEEDED[@]}" | sort); do
+      echo "[precheck] Check bridge $bridge on node $node: VLANs needed:$(tr ' ' '\n' <<< "${BRIDGE_VLANS_NEEDED[$bridge]}" | sort -nu | tr '\n' ' ' | sed 's/^ *//; s/ $//; s/^/ /')"
+      if ! json=$(pvesh get "/nodes/${node}/network/${bridge}" --output-format json 2>&1); then
+        echo "ERROR: bridge '$bridge' not found on node $node (pvesh: ${json//$'\n'/ })" >&2
+        failed=1
+        continue
+      fi
+      if ! result=$(NEEDED="${BRIDGE_VLANS_NEEDED[$bridge]}" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+needed = sorted({int(x) for x in os.environ["NEEDED"].split()})
+tagged = [v for v in needed if v != 0]
+if d.get("type") not in (None, "bridge", "OVSBridge"):
+    print("NOBRIDGE %s" % d.get("type")); sys.exit(0)
+if not tagged:
+    print("OK untagged only"); sys.exit(0)
+if str(d.get("bridge_vlan_aware", "0")) not in ("1", "yes", "true", "True"):
+    print("NOTAWARE"); sys.exit(0)
+raw = str(d.get("bridge_vids") or "").strip()
+if not raw:
+    print("NOVIDS"); sys.exit(0)
+have = set()
+for part in raw.replace(",", " ").split():
+    if "-" in part:
+        a, b = part.split("-", 1); have.update(range(int(a), int(b) + 1))
+    else:
+        have.add(int(part))
+missing = [v for v in tagged if v not in have]
+print(("MISSING %s %s" % (",".join(map(str, missing)), raw)) if missing else ("OK %s" % raw))
+' <<< "$json" 2>&1); then
+        echo "ERROR: could not read the network config of $bridge on $node: $result" >&2
+        failed=1
+        continue
+      fi
+      case "$result" in
+        OK*)
+          echo "  - $node $bridge: OK (bridge-vids: ${result#OK })" ;;
+        NOBRIDGE*)
+          echo "ERROR: '$bridge' on node $node is not a bridge (type ${result#NOBRIDGE })" >&2; failed=1 ;;
+        NOTAWARE)
+          echo "ERROR: bridge '$bridge' on node $node is not VLAN-aware, but tagged VLANs are needed on it." >&2
+          echo "  Enable 'VLAN aware' on $bridge (node $node > System > Network) or use another bridge." >&2
+          failed=1 ;;
+        NOVIDS)
+          echo "ERROR: bridge '$bridge' on node $node has no bridge-vids set, so the VLANs cannot be verified." >&2
+          echo "  Set bridge-vids explicitly (e.g. in /etc/network/interfaces) or run with CHECK_BRIDGE_VLANS=0." >&2
+          failed=1 ;;
+        MISSING*)
+          read -r _ miss vids <<< "$result"
+          echo "ERROR: bridge '$bridge' on node $node does not carry VLAN(s) $miss (bridge-vids: $vids); nothing created." >&2
+          echo "  Add them to bridge-vids of $bridge on $node, or fix CLUSTER_/DATA_/CIFS_/TRUNK_* in the config." >&2
+          echo "  Design: vmbr0 = mgmt/data VLAN 50, vmbr1 = interconnect 5N and trunk 100;101;102." >&2
+          failed=1 ;;
+        *)
+          echo "ERROR: unexpected result for $bridge on $node: $result" >&2; failed=1 ;;
+      esac
+    done
+  done
+  if (( failed )); then
+    echo "ERROR: bridge/VLAN precheck failed; no VM was created." >&2
+    exit 1
+  fi
+}
+
 validate_num_ports() {
   if ! [[ "$NUM_NET_PORTS" =~ ^[0-9]+$ ]] || (( NUM_NET_PORTS < 4 )); then
     echo "ERROR: NUM_NET_PORTS moet een geheel getal >= 4 zijn (waarde: '$NUM_NET_PORTS')" >&2
@@ -959,59 +1216,62 @@ validate_num_ports() {
     echo "  Geldige waarden: 5, 8, 11, 14, ..." >&2
     exit 1
   fi
+  if [[ -n "$TRUNK_PORT" ]] && (( TRUNK_PORT >= NUM_NET_PORTS )); then
+    echo "ERROR: TRUNK_PORT=$TRUNK_PORT does not exist with NUM_NET_PORTS=$NUM_NET_PORTS (net0-net$(( NUM_NET_PORTS - 1 )))." >&2
+    echo "  Use a lower TRUNK_PORT or TRUNK_PORT=none." >&2
+    exit 1
+  fi
 }
 
 # Print ONTAP port-mapping en ifgroup-commando's voor na de cluster-setup.
 print_port_info() {
-  local ports_per_proto=$(( (NUM_NET_PORTS - 2) / 3 ))
   local letters="abcdefghijklmnopqrstuvwxyz"
-  local i netid
+  local p role label
+  local -a a0a=() a0b=() iscsi=()
 
   echo ""
   echo "Netwerk poort-mapping (per ONTAP node, ${NUM_NET_PORTS} poorten):"
   printf "  %-7s  %-5s  %-22s  %s\n" "Proxmox" "ONTAP" "Doel" "Bridge"
   printf "  %-7s  %-5s  %-22s  %s\n" "-------" "-----" "----" "------"
-  for (( i=0; i<2; i++ )); do
-    printf "  net%-4d e0%-4s %-22s  %s vlan %s\n" \
-      "$i" "${letters:$i:1}" "cluster interconnect" "$CLUSTER_BRIDGE" "$CLUSTER_VLAN_TAG"
+  for (( p=0; p<NUM_NET_PORTS; p++ )); do
+    role="$(port_role "$p")"
+    case "$role" in
+      cluster) label="cluster interconnect" ;;
+      cifs)    label="cifs  (ifgroup a0a)"; a0a+=("e0${letters:$p:1}") ;;
+      nfs)     label="nfs   (ifgroup a0b)"; a0b+=("e0${letters:$p:1}") ;;
+      iscsi)   label="iscsi (individueel)"; iscsi+=("e0${letters:$p:1}") ;;
+      trunk)   label="trunk (VLAN-poorten)" ;;
+    esac
+    printf "  net%-4d e0%-4s %-22s  %s\n" "$p" "${letters:$p:1}" "$label" "$(nic_desc_for_port "$p")"
   done
-  for (( i=0; i<ports_per_proto; i++ )); do
-    netid=$(( 2 + i ))
-    printf "  net%-4d e0%-4s %-22s  %s vlan %s\n" \
-      "$netid" "${letters:$netid:1}" "cifs  (ifgroup a0a)" "$CIFS_BRIDGE" "$CIFS_VLAN_TAG"
-  done
-  for (( i=0; i<ports_per_proto; i++ )); do
-    netid=$(( 2 + ports_per_proto + i ))
-    printf "  net%-4d e0%-4s %-22s  %s vlan %s\n" \
-      "$netid" "${letters:$netid:1}" "nfs   (ifgroup a0b)" "$DATA_BRIDGE" "$DATA_VLAN_TAG"
-  done
-  for (( i=0; i<ports_per_proto; i++ )); do
-    netid=$(( 2 + 2*ports_per_proto + i ))
-    printf "  net%-4d e0%-4s %-22s  %s vlan %s\n" \
-      "$netid" "${letters:$netid:1}" "iscsi (individueel)" "$DATA_BRIDGE" "$DATA_VLAN_TAG"
-  done
+  if [[ -n "$TRUNK_PORT" ]] && (( TRUNK_PORT >= NUM_NET_PORTS )); then
+    echo "  (TRUNK_PORT=$TRUNK_PORT valt buiten de $NUM_NET_PORTS poorten: geen trunkpoort)"
+  fi
 
   echo ""
   echo "ONTAP ifgroup-commando's (uitvoeren per node na cluster-init):"
-  echo "  # CIFS ifgroup a0a:"
-  echo "  network port ifgrp create -node <node> -ifgrp a0a -distr-func port -mode multimode_lacp"
-  for (( i=0; i<ports_per_proto; i++ )); do
-    netid=$(( 2 + i ))
-    echo "  network port ifgrp add-port -node <node> -ifgrp a0a -port e0${letters:$netid:1}"
-  done
-  echo ""
-  echo "  # NFS ifgroup a0b:"
-  echo "  network port ifgrp create -node <node> -ifgrp a0b -distr-func port -mode multimode_lacp"
-  for (( i=0; i<ports_per_proto; i++ )); do
-    netid=$(( 2 + ports_per_proto + i ))
-    echo "  network port ifgrp add-port -node <node> -ifgrp a0b -port e0${letters:$netid:1}"
-  done
-  echo ""
+  if (( ${#a0a[@]} )); then
+    echo "  # CIFS ifgroup a0a:"
+    echo "  network port ifgrp create -node <node> -ifgrp a0a -distr-func port -mode multimode_lacp"
+    for p in "${a0a[@]}"; do echo "  network port ifgrp add-port -node <node> -ifgrp a0a -port $p"; done
+    echo ""
+  fi
+  if (( ${#a0b[@]} )); then
+    echo "  # NFS ifgroup a0b:"
+    echo "  network port ifgrp create -node <node> -ifgrp a0b -distr-func port -mode multimode_lacp"
+    for p in "${a0b[@]}"; do echo "  network port ifgrp add-port -node <node> -ifgrp a0b -port $p"; done
+    echo ""
+  fi
   echo "  # iSCSI poorten (individueel, geen ifgroup):"
-  for (( i=0; i<ports_per_proto; i++ )); do
-    netid=$(( 2 + 2*ports_per_proto + i ))
-    echo "  #   e0${letters:$netid:1}"
-  done
+  for p in "${iscsi[@]}"; do echo "  #   $p"; done
+  if [[ -n "$TRUNK_PORT" ]] && (( TRUNK_PORT < NUM_NET_PORTS )); then
+    echo ""
+    echo "  # Trunkpoort e0${letters:$TRUNK_PORT:1} (niet in een ifgroup): VLAN-poorten per VLAN, bijvoorbeeld"
+    local v
+    for v in $(trunk_vlan_list); do
+      echo "  network port vlan create -node <node> -vlan-name e0${letters:$TRUNK_PORT:1}-$v"
+    done
+  fi
 }
 
 cleanup_vm_and_orphaned_disks() {
@@ -1368,19 +1628,9 @@ create_vm() {
   ensure_machine_type "$vmid" "$target_node"
 
   echo "[VM $vmid] Add $NUM_NET_PORTS network interfaces on $target_node"
-  local _ports_per_proto=$(( (NUM_NET_PORTS - 2) / 3 ))
-  local _cifs_end=$(( 2 + _ports_per_proto ))
+  # Bridge/VLAN per port comes from nic_spec_for_port (same as --show-ports/--dry-run)
   for (( _p=0; _p<NUM_NET_PORTS; _p++ )); do
-    if (( _p < 2 )); then
-      # cluster interconnect (0,1) → CLUSTER_BRIDGE
-      run_on_node "$target_node" qm set "$vmid" "--net${_p}" "$(format_nic "$CLUSTER_BRIDGE" "$CLUSTER_VLAN_TAG")"
-    elif (( _p < _cifs_end )); then
-      # cifs-poorten → CIFS_BRIDGE (default: DATA_BRIDGE)
-      run_on_node "$target_node" qm set "$vmid" "--net${_p}" "$(format_nic "$CIFS_BRIDGE" "$CIFS_VLAN_TAG")"
-    else
-      # nfs + iscsi → DATA_BRIDGE
-      run_on_node "$target_node" qm set "$vmid" "--net${_p}" "$(format_nic "$DATA_BRIDGE" "$DATA_VLAN_TAG")"
-    fi
+    run_on_node "$target_node" qm set "$vmid" "--net${_p}" "$(nic_spec_for_port "$_p")"
   done
 
   # The VMDKs were extracted (and the sim disk checked) before the first VM
@@ -1506,7 +1756,7 @@ create_vm() {
   fi
 
   run_on_node "$target_node" qm set "$vmid" --boot order=ide0
-  run_on_node "$target_node" qm set "$vmid" --description "NetApp ONTAP Simulator 9.16.1 two-node lab; ${NUM_NET_PORTS} ports; cluster=${CLUSTER_BRIDGE}/vlan ${CLUSTER_VLAN_TAG}, cifs=${CIFS_BRIDGE}/vlan ${CIFS_VLAN_TAG}, data=${DATA_BRIDGE}/vlan ${DATA_VLAN_TAG}; sim disks=$(sim_disk_summary); script v${SCRIPT_VERSION}; host=${target_node}"
+  run_on_node "$target_node" qm set "$vmid" --description "NetApp ONTAP Simulator 9.16.1 two-node lab; ${NUM_NET_PORTS} ports; cluster=${CLUSTER_BRIDGE}/vlan ${CLUSTER_VLAN_TAG}, cifs=${CIFS_BRIDGE}/vlan ${CIFS_VLAN_TAG}, data=${DATA_BRIDGE}/vlan ${DATA_VLAN_TAG}, trunk=${TRUNK_PORT:+net${TRUNK_PORT} ${TRUNK_BRIDGE}/${TRUNK_VLANS}}${TRUNK_PORT:-none}; sim disks=$(sim_disk_summary); script v${SCRIPT_VERSION}; host=${target_node}"
 
   echo "[VM $vmid] Final disk/boot config on $target_node:"
   run_on_node "$target_node" qm config "$vmid" | grep -E '^(boot|ide|sata|scsi|serial|vga):' || true
@@ -1776,6 +2026,9 @@ if (( SHOW_PORTS == 1 )); then
   validate_num_ports
   echo "[start] $(basename "$0") v${SCRIPT_VERSION} — network plan only (--show-ports), nothing is changed"
   print_port_info
+  print_nic_commands
+  echo ""
+  echo "Bridges and VLANs are NOT checked against the nodes here; --dry-run (on a Proxmox host) does that."
   print_sim_disk_info
   echo ""
   echo "Note: this is a plan only. For the real capacity of the sim disk in the OVA (how many"
@@ -1804,6 +2057,10 @@ cat <<STARTINFO
   DATA_VLAN_TAG    = ${DATA_VLAN_TAG}
   CIFS_BRIDGE      = ${CIFS_BRIDGE}
   CIFS_VLAN_TAG    = ${CIFS_VLAN_TAG}
+  TRUNK_PORT       = ${TRUNK_PORT:-none}
+  TRUNK_BRIDGE     = ${TRUNK_BRIDGE}
+  TRUNK_VLANS      = ${TRUNK_VLANS}
+  CHECK_BRIDGE_VLANS = ${CHECK_BRIDGE_VLANS}
   NUM_NET_PORTS    = ${NUM_NET_PORTS}
   SIM DISKS        = $(sim_disk_summary)
 STARTINFO
@@ -1816,7 +2073,17 @@ OVA_DIR_RESOLVED="$OVA_DIR"
 OVA_PATH="$OVA_DIR_RESOLVED/$OVA_NAME"
 
 validate_node_access
+check_bridge_vlans
 alloc_vmids
+
+if (( DRY_RUN == 1 )); then
+  echo ""
+  echo "[dry-run] All prechecks passed. Nothing has been created or changed."
+  print_port_info
+  print_nic_commands "$VMID1" "$VMID2"
+  exit 0
+fi
+
 derive_node_identities
 
 # 1. Free space on every host that extracts (once per host), 2. extract the OVA

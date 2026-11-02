@@ -5,6 +5,37 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.3] – 2026-11-02
+
+### Fixed
+- **NICs of the simulator ended up on the wrong bridge.** On lab-cluster1 (VM 100) net0/net1 (e0a/e0b, cluster interconnect, VLAN 51) landed on `vmbr0` and net2–net4/net6/net7 (e0c–e0e/e0g/e0h, mgmt/data, VLAN 50) on `vmbr1`. Cause: the script itself was consistent (net0/1 → `CLUSTER_*`, the rest → `CIFS_*`/`DATA_*`), but
+  - the defaults and the example config put the data ports on `vmbr1` (`DATA_BRIDGE=vmbr1`, `DATA_VLAN_TAG=20`/`53`), the 10 Gb bridge that in this design carries the interconnect;
+  - the local config for lab-cluster1 then had the two bridges swapped (`CLUSTER_BRIDGE=vmbr0`, `DATA_BRIDGE=vmbr1`), while lab-cluster2/3 had them right;
+  - nothing checked whether a bridge actually carries the VLAN, so a tag that `vmbr0`/`vmbr1` does not pass (51 on `vmbr0`, 50 on `vmbr1`) was accepted silently: the interconnect and mgmt simply had no link.
+- net5 (e0f) was never set as a trunk by the script (it was a normal nfs port); the trunk `100;101;102` had to be set by hand after deploying.
+
+### Added
+- **Trunk port:** `TRUNK_PORT` (default `5` = e0f), `TRUNK_BRIDGE` (default `vmbr1`) and `TRUNK_VLANS` (default `100;101;102`, `;`-separated, ranges allowed). The trunk port replaces that port in its group and is left out of the ifgroup commands; `--show-ports` prints `network port vlan create` examples for it. `TRUNK_PORT=none` = no trunk port.
+- **Bridge/VLAN precheck** `check_bridge_vlans()`: for both target nodes, every bridge used must exist, be VLAN-aware and have every VLAN used (cluster, data, cifs, trunk) in its `bridge-vids` (read with `pvesh get /nodes/<node>/network/<bridge>`, ranges like `2-4094` understood). On any failure the script stops before the first VM is created, with node, bridge, missing VLANs and the current `bridge-vids`. `CHECK_BRIDGE_VLANS=0` skips it.
+- **`--dry-run`** (Proxmox host): all prechecks (API, storage, OVA, VG, bridges/VLANs, VMIDs) and the exact `qm set <vmid> --netN …` commands per node; nothing is created, not even `WORKDIR`.
+- `--show-ports` now also prints the `qm set` commands (no node contact).
+- Validation: the cluster VLAN inside `TRUNK_VLANS` on the same bridge is refused; `TRUNK_PORT` on net0/net1 or outside `NUM_NET_PORTS` is refused; bridge names are checked.
+- `tests/test_network.sh`: 25 checks with stubbed `pvesh`/`pvesm`/`qm` (no Proxmox needed), including a regression test for the swapped bridges of VM 100.
+
+### Changed
+- **Bridges and VLANs in one block**, with a comment saying which bridge is which network (`vmbr0` = 1 Gb, mgmt/data VLAN 50; `vmbr1` = 10 Gb, interconnect 5N and trunk 100–102), in the script defaults and in the config (same names).
+- **Defaults follow the design:** `DATA_BRIDGE=vmbr0` (was `vmbr1`), `DATA_VLAN_TAG=50` (was `20`). The example config now has `DATA_BRIDGE="vmbr0"`, `DATA_VLAN_TAG="50"` and the `TRUNK_*` settings.
+- One function, `nic_spec_for_port()`, decides bridge/VLAN per port; `create_vm`, `--show-ports` and `--dry-run` all use it, so the plan and the deploy cannot differ.
+- The startup summary and the VM description show the trunk port.
+
+### Notes
+- **Behaviour change** for configs that do not set `DATA_BRIDGE`/`DATA_VLAN_TAG` (they now get `vmbr0`/50) or `TRUNK_PORT` (net5 becomes a trunk). Check every local config with `--show-ports` before the next deploy.
+- The precheck reads the node's network **configuration** through the API, not the running bridge. Pending changes in `/etc/network/interfaces.new` that were not applied are not seen as active.
+- Existing VMs are not changed. VM 100/101 (lab-cluster1) still need their NICs corrected by hand or a redeploy.
+- Not tested against a real Proxmox node: the field names `bridge_vlan_aware`/`bridge_vids` come from the Proxmox API documentation; `--dry-run` on pve02 is the first real test.
+
+---
+
 ## [v3.2.1] – 2026-10-08
 
 ### Changed

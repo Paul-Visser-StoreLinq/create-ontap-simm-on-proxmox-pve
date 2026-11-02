@@ -99,16 +99,43 @@ All settings can be passed as environment variables. The values below are the de
 
 | Variable | Default | Description |
 |---|---|---|
+All bridges and VLANs live in **one block**: the *Network Configuration* section of the config (the script has the same names, with the same defaults, in one block). The comment there says which bridge is which network. Default layout (StoreLinq design):
+
+| Bridge | Physical | Carries |
+|---|---|---|
+| `vmbr0` | 1 Gb | lab management and data, VLAN 50 |
+| `vmbr1` | 10 Gb | cluster interconnect per cluster (lab-clusterN → VLAN 5N, L2 only) and the trunk VLANs 100;101;102 |
+
+| Proxmox | ONTAP | Role | Bridge / VLAN |
+|---|---|---|---|
+| net0, net1 | e0a, e0b | cluster interconnect | `CLUSTER_BRIDGE` / `CLUSTER_VLAN_TAG` (vmbr1 / 5N) |
+| net2–net4, net6, net7 | e0c–e0e, e0g, e0h | mgmt/data (cifs, nfs, iscsi groups) | `DATA_BRIDGE` / `DATA_VLAN_TAG` (vmbr0 / 50) |
+| net5 | e0f | trunk | `TRUNK_BRIDGE` / `TRUNK_VLANS` (vmbr1 / 100;101;102) |
+
+| Variable | Default | Description |
+|---|---|---|
 | `CLUSTER_BRIDGE` | `vmbr1` | Bridge for the cluster interconnect (net0, net1) |
 | `CLUSTER_VLAN_TAG` | *(none, required)* | VLAN tag for the cluster interconnect (`0` = untagged). Script aborts if empty |
-| `DATA_BRIDGE` | `vmbr1` | Bridge for data ports (NFS, iSCSI) |
-| `DATA_VLAN_TAG` | `20` | VLAN tag for data ports |
+| `DATA_BRIDGE` | `vmbr0` | Bridge for the mgmt/data ports (cifs, nfs, iscsi groups). Was `vmbr1` before v3.3 |
+| `DATA_VLAN_TAG` | `50` | VLAN tag for the mgmt/data ports. Was `20` before v3.3 |
 | `CIFS_BRIDGE` | `DATA_BRIDGE` | Optional override: bridge for CIFS ports |
 | `CIFS_VLAN_TAG` | `DATA_VLAN_TAG` | Optional override: VLAN tag for CIFS ports |
+| `TRUNK_PORT` | `5` | Proxmox port (net index) that becomes a trunk; replaces that port in its group. `none` = no trunk port |
+| `TRUNK_BRIDGE` | `vmbr1` | Bridge for the trunk port |
+| `TRUNK_VLANS` | `100;101;102` | VLANs on the trunk port (Proxmox `trunks=`; `;`-separated, ranges like `100-102` allowed) |
+| `CHECK_BRIDGE_VLANS` | `1` | Check bridges and `bridge-vids` on both nodes before anything is created; `0` skips it (not recommended) |
 
-The script aborts at startup if cluster and data use the same bridge **and** the same VLAN tag (including `0`/`0`), since everything would then share one L2 domain.
+The script aborts at startup if cluster and data use the same bridge **and** the same VLAN tag (including `0`/`0`), since everything would then share one L2 domain. It also refuses the cluster VLAN inside `TRUNK_VLANS` on the same bridge, and a `TRUNK_PORT` on net0/net1 or outside `NUM_NET_PORTS`.
 
-Use `./ontap-sim-2node-proxmox.sh --show-ports` to print the resulting bridge/VLAN per port without changing anything (works on any machine). `--version` shows the script version.
+**Bridge/VLAN precheck.** Before the first VM is created, the script reads `pvesh get /nodes/<node>/network/<bridge>` for both target nodes (Proxmox API, no SSH needed) and stops with a clear message when a bridge is missing, is not VLAN-aware, has no `bridge-vids`, or does not carry a VLAN the deploy needs (for example `vmbr0` without 50, or `vmbr1` without 5N or 100–102). It checks the network **configuration** of the node, not the running bridge (`bridge vlan show`): after changing `/etc/network/interfaces`, apply it first.
+
+**Seeing the result before deploying.**
+- `./ontap-sim-2node-proxmox.sh --config <conf> --show-ports` prints the port table and the exact `qm set <vmid> --netN …` commands per node, without changing anything (works on any machine, does not contact the nodes).
+- `./ontap-sim-2node-proxmox.sh --config <conf> --dry-run` (on a Proxmox host) runs all prechecks, including the bridge/VLAN check and the VMID check, and prints the same commands; it creates nothing (not even `WORKDIR`).
+
+`--version` shows the script version.
+
+**Upgrading a local config from v3.2.x.** A config that sets `DATA_BRIDGE`/`DATA_VLAN_TAG` explicitly keeps those values. Check each local `ontap-sim-2node-*-cluster*.conf` with `--show-ports`: net0/net1 must be on the interconnect bridge, the data ports on the data bridge. A config without `TRUNK_*` gets the default trunk on net5; set `TRUNK_PORT="none"` for the old behaviour.
 
 ### Local configs
 
@@ -289,6 +316,7 @@ Then follow the standard ONTAP cluster setup wizard on node1 and join node2 via 
 | v3.1.2 | 08-10-2026 | Free-space check on `WORKDIR` per host before extracting; OVA extracted once when both nodes share a host; extracted directories removed after a successful run (`KEEP_EXTRACTED`) |
 | v3.2 | 08-10-2026 | `--show-sim-disk` (capacity of the sim disk per disk type, no VM created); `SIM_DISKS_PER_SHELF="auto"` |
 | v3.2.1 | 08-10-2026 | `--show-sim-disk` table shows the equal-per-shelf layout the config can do (e.g. `2 x 12 = 24`, with `(max 25)`), consistent with `auto` |
+| v3.3 | 02-11-2026 | Fix NICs on the wrong bridge; bridges/VLANs in one block with defaults per the design (data `vmbr0`/50); trunk port net5 (`TRUNK_*`); bridge/VLAN precheck against `bridge-vids` on both nodes; `--dry-run`; `--show-ports` prints the `qm set` commands; `tests/test_network.sh` |
 
 ---
 
