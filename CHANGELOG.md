@@ -16,11 +16,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 - **Trunk port:** `TRUNK_PORT` (default `5` = e0f), `TRUNK_BRIDGE` (default `vmbr1`) and `TRUNK_VLANS` (default `100;101;102`, `;`-separated, ranges allowed). The trunk port replaces that port in its group and is left out of the ifgroup commands; `--show-ports` prints `network port vlan create` examples for it. `TRUNK_PORT=none` = no trunk port.
-- **Bridge/VLAN precheck** `check_bridge_vlans()`: for both target nodes, every bridge used must exist, be VLAN-aware and have every VLAN used (cluster, data, cifs, trunk) in its `bridge-vids` (read with `pvesh get /nodes/<node>/network/<bridge>`, ranges like `2-4094` understood). On any failure the script stops before the first VM is created, with node, bridge, missing VLANs and the current `bridge-vids`. `CHECK_BRIDGE_VLANS=0` skips it.
+- **Bridge/VLAN precheck** `check_bridge_vlans()`: for both target nodes, every bridge used must exist, be VLAN-aware and have every VLAN used (cluster, data, cifs, trunk) in its `bridge-vids` (read with `pvesh get /nodes/<node>/network/<bridge>`; `bridge-vids` may contain single VLANs and ranges, separated by spaces or commas, e.g. `2-4094` or `10 20 50-53 100-102`; an unreadable value such as a reversed range or a VLAN above 4094 stops the precheck). On any failure the script stops before the first VM is created, with node, bridge, missing VLANs and the current `bridge-vids`. `CHECK_BRIDGE_VLANS=0` skips it.
 - **`--dry-run`** (Proxmox host): all prechecks (API, storage, OVA, VG, bridges/VLANs, VMIDs) and the exact `qm set <vmid> --netN …` commands per node; nothing is created, not even `WORKDIR`.
 - `--show-ports` now also prints the `qm set` commands (no node contact).
 - Validation: the cluster VLAN inside `TRUNK_VLANS` on the same bridge is refused; `TRUNK_PORT` on net0/net1 or outside `NUM_NET_PORTS` is refused; bridge names are checked.
-- `tests/test_network.sh`: 25 checks with stubbed `pvesh`/`pvesm`/`qm` (no Proxmox needed), including a regression test for the swapped bridges of VM 100.
+- `tests/test_network.sh`: 36 checks with stubbed `pvesh`/`pvesm`/`qm` (no Proxmox needed), including a regression test for the swapped bridges of VM 100 and 11 checks for ranges and combinations in `bridge-vids`.
 
 ### Changed
 - **Bridges and VLANs in one block**, with a comment saying which bridge is which network (`vmbr0` = 1 Gb, mgmt/data VLAN 50; `vmbr1` = 10 Gb, interconnect 5N and trunk 100–102), in the script defaults and in the config (same names).
@@ -31,7 +31,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Notes
 - **Behaviour change** for configs that do not set `DATA_BRIDGE`/`DATA_VLAN_TAG` (they now get `vmbr0`/50) or `TRUNK_PORT` (net5 becomes a trunk). Check every local config with `--show-ports` before the next deploy.
 - The precheck reads the node's network **configuration** through the API, not the running bridge. Pending changes in `/etc/network/interfaces.new` that were not applied are not seen as active.
-- Existing VMs are not changed. VM 100/101 (lab-cluster1) still need their NICs corrected by hand or a redeploy.
+- Existing VMs are not changed by this version. The NICs of VM 100–107 were corrected by hand on 02-11-2026 (`pvesh`, MAC addresses kept).
 - Not tested against a real Proxmox node: the field names `bridge_vlan_aware`/`bridge_vids` come from the Proxmox API documentation; `--dry-run` on pve02 is the first real test.
 
 ---

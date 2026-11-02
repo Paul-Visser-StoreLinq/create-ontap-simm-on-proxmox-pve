@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tests/test_network.sh — network mapping and bridge/VLAN precheck (v3.3)
+# tests/test_network.sh — network mapping and bridge/VLAN precheck (v3.3; ranges in bridge-vids)
 #
 # Runs on any machine with bash >= 4 and python3 (no Proxmox needed): qm, pvesh
 # and pvesm are replaced by stubs that read fixtures from a temp directory.
@@ -126,6 +126,35 @@ good_fixtures; fx pve02 vmbr0 1 ""
 expect_fail "vmbr0 without bridge-vids" "has no bridge-vids set" --config "$(mkconf 1)" --dry-run
 good_fixtures; rm -f "$FX/net-pve04-vmbr1.json"
 expect_fail "vmbr1 missing on pve04" "bridge 'vmbr1' not found on node pve04" --config "$(mkconf 1)" --dry-run
+
+echo "== bridge-vids with ranges and combinations"
+vids_ok() { # name vmbr0-vids vmbr1-vids
+  local name="$1" n
+  rm -f "$FX"/net-*.json
+  for nd in pve02 pve04; do fx "$nd" vmbr0 1 "$2"; fx "$nd" vmbr1 1 "$3"; done
+  for n in 1 2 3; do
+    out="$(run --config "$(mkconf $n)" --dry-run)"; rc=$?
+    if [[ $rc -ne 0 ]] || ! grep -q "All prechecks passed" <<< "$out"; then bad "$name (cluster$n rc=$rc)" "$out"; return; fi
+  done
+  ok "$name"
+}
+vids_ok "vmbr1 2-4094 (live pve02), vmbr0 2-4094" "2-4094" "2-4094"
+vids_ok "vmbr1 '10 20 50-53 100-102'" "30 50 99" "10 20 50-53 100-102"
+vids_ok "range boundaries exact: vmbr0 50-50, vmbr1 51-53 100-102" "50-50" "51-53 100-102"
+vids_ok "comma-separated: vmbr0 '30,50,99', vmbr1 '51,52,53,100-102'" "30,50,99" "51,52,53,100-102"
+vids_ok "range around the VLAN: vmbr0 2-99, vmbr1 10-200" "2-99" "10-200"
+good_fixtures; fx pve02 vmbr1 1 "10 20 50-52 100-102"
+expect_fail "range 50-52 lacks 53 (cluster3)" "bridge 'vmbr1' on node pve02 does not carry VLAN\(s\) 53 \(bridge-vids: 10 20 50-52 100-102\)" --config "$(mkconf 3)" --dry-run
+good_fixtures; fx pve04 vmbr1 1 "51-53 100-101"
+expect_fail "range 100-101 lacks trunk VLAN 102" "does not carry VLAN\(s\) 102" --config "$(mkconf 1)" --dry-run
+good_fixtures; fx pve02 vmbr0 1 "2-49 51-4094"
+expect_fail "VLAN 50 in the gap between two ranges" "bridge 'vmbr0' on node pve02 does not carry VLAN\(s\) 50" --config "$(mkconf 1)" --dry-run
+good_fixtures; fx pve02 vmbr1 1 "102-100"
+expect_fail "reversed range refused" "bridge-vids of 'vmbr1' on node pve02 cannot be read: '102-100'" --config "$(mkconf 1)" --dry-run
+good_fixtures; fx pve02 vmbr1 1 "2-5000"
+expect_fail "range beyond 4094 refused" "cannot be read: '2-5000'" --config "$(mkconf 1)" --dry-run
+good_fixtures; fx pve04 vmbr0 1 "50 abc"
+expect_fail "garbage in bridge-vids refused" "bridge-vids of 'vmbr0' on node pve04 cannot be read" --config "$(mkconf 1)" --dry-run
 
 echo "== regression VM 100 (02-11-2026): interconnect on vmbr0, data on vmbr1"
 good_fixtures

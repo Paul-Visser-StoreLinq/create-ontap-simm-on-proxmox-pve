@@ -1160,12 +1160,17 @@ if str(d.get("bridge_vlan_aware", "0")) not in ("1", "yes", "true", "True"):
 raw = str(d.get("bridge_vids") or "").strip()
 if not raw:
     print("NOVIDS"); sys.exit(0)
+# bridge-vids: single VLANs and ranges, separated by spaces or commas,
+# e.g. "2-4094", "100-102" or "10 20 50-53 100-102"
 have = set()
 for part in raw.replace(",", " ").split():
-    if "-" in part:
-        a, b = part.split("-", 1); have.update(range(int(a), int(b) + 1))
-    else:
-        have.add(int(part))
+    lo, sep, hi = part.partition("-")
+    if not lo.isdigit() or (sep and not hi.isdigit()):
+        print("BADVIDS %s" % raw); sys.exit(0)
+    a = int(lo); b = int(hi) if sep else a
+    if a < 1 or b > 4094 or a > b:
+        print("BADVIDS %s" % raw); sys.exit(0)
+    have.update(range(a, b + 1))
 missing = [v for v in tagged if v not in have]
 print(("MISSING %s %s" % (",".join(map(str, missing)), raw)) if missing else ("OK %s" % raw))
 ' <<< "$json" 2>&1); then
@@ -1185,6 +1190,10 @@ print(("MISSING %s %s" % (",".join(map(str, missing)), raw)) if missing else ("O
         NOVIDS)
           echo "ERROR: bridge '$bridge' on node $node has no bridge-vids set, so the VLANs cannot be verified." >&2
           echo "  Set bridge-vids explicitly (e.g. in /etc/network/interfaces) or run with CHECK_BRIDGE_VLANS=0." >&2
+          failed=1 ;;
+        BADVIDS*)
+          echo "ERROR: bridge-vids of '$bridge' on node $node cannot be read: '${result#BADVIDS }'." >&2
+          echo "  Expected single VLANs and ranges 1-4094, e.g. '2-4094' or '10 20 50-53 100-102'." >&2
           failed=1 ;;
         MISSING*)
           read -r _ miss vids <<< "$result"
