@@ -5,6 +5,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.4] – 2026-11-02
+
+### Fixed
+- **ifgroup advice used `-mode multimode_lacp`.** A Proxmox Linux bridge has no LACP partner and never forwards LACPDUs (`01:80:c2:00:00:02`; the kernel does not allow that bit in `group_fwd_mask`), so an LACP ifgroup does not come up in the simulator. The advice now uses `-mode singlemode`. Static `multimode` would put one MAC address on several tap ports of the same bridge (MAC flapping) and adds no bandwidth on a virtual e1000.
+- **ifgroup a0a was advised on ports that host LIFs.** After the cluster setup the node-mgmt LIF is on `e0c` (every node) and `cluster_mgmt` on `e0d` (node 1). ONTAP does not add a port that hosts LIFs to an ifgroup, so the old advice failed at `add-port`. The advice now: parks `cluster_mgmt` on node 2, builds a0a on the free `e0d` (port out of the broadcast domain first, a0a into it afterwards), moves `cluster_mgmt` back to node 1 on a0a, then per node moves the node-mgmt LIF to a0a and only then adds `e0c`. Each `add-port` is preceded by `network interface show -curr-node <node> -curr-port <port>` (must be empty). Do it from the VM console, not over ssh on one of these LIFs.
+
+### Added
+- `NODE_MGMT_PORT` (default `e0c`) and `CLUSTER_MGMT_PORT` (default `e0d`): where the cluster setup puts the management LIFs; the advice uses them.
+- `tests/test_network.sh`: 48 checks (4 for the ifgroup advice: mode, order of the LIF moves, no parking when `cluster_mgmt` is outside the ifgroups, step numbering).
+
+### Notes
+- **Not verified on a simulator.** Check mode and order at the next cluster setup (`network port ifgrp show`, `network port show -port a0a`, LIFs home after `revert`). The StoreLinq setup documents do not use ifgroups.
+
+---
+
 ## [v3.3] – 2026-11-02
 
 ### Fixed

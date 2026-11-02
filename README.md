@@ -137,6 +137,8 @@ The script aborts at startup if cluster and data use the same bridge **and** the
 
 **Upgrading a local config from v3.2.x.** A config that sets `DATA_BRIDGE`/`DATA_VLAN_TAG` explicitly keeps those values. Check each local `ontap-sim-2node-*-cluster*.conf` with `--show-ports`: net0/net1 must be on the interconnect bridge, the data ports on the data bridge. A config without `TRUNK_*` gets the default trunk on net5; set `TRUNK_PORT="none"` for the old behaviour.
 
+
+**ifgroup advice (after the cluster setup).** `--show-ports` and `--dry-run` print `network port ifgrp` commands. They use `-mode singlemode`: a Linux bridge in Proxmox has no LACP partner and does not forward LACPDUs, so `multimode_lacp` never comes up, and static `multimode` puts one MAC on several tap ports of the same bridge. Because the cluster setup puts the node-mgmt LIF on `e0c` and `cluster_mgmt` on `e0d`, and ONTAP does not add a port that hosts LIFs to an ifgroup, the advice moves those LIFs first (run it from the VM console). Not yet verified on a simulator.
 ### Local configs
 
 `ontap-sim-2node-proxmox.conf` is the only example config in the repo. Copy it to your own local config and pass it with `--config`:
@@ -317,6 +319,7 @@ Then follow the standard ONTAP cluster setup wizard on node1 and join node2 via 
 | v3.2 | 08-10-2026 | `--show-sim-disk` (capacity of the sim disk per disk type, no VM created); `SIM_DISKS_PER_SHELF="auto"` |
 | v3.2.1 | 08-10-2026 | `--show-sim-disk` table shows the equal-per-shelf layout the config can do (e.g. `2 x 12 = 24`, with `(max 25)`), consistent with `auto` |
 | v3.3 | 02-11-2026 | Fix NICs on the wrong bridge; bridges/VLANs in one block with defaults per the design (data `vmbr0`/50); trunk port net5 (`TRUNK_*`); bridge/VLAN precheck against `bridge-vids` on both nodes; `--dry-run`; `--show-ports` prints the `qm set` commands; `tests/test_network.sh` |
+| v3.4 | 02-11-2026 | ifgroup advice: `-mode singlemode` instead of `multimode_lacp` (no LACP over a Linux bridge); LIFs move off `e0c`/`e0d` before they join a0a; `NODE_MGMT_PORT`/`CLUSTER_MGMT_PORT`; not yet verified on a simulator |
 
 ---
 

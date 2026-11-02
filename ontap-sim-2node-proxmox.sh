@@ -123,6 +123,15 @@
 #                   commands per node; creates nothing. --show-ports also
 #                   prints those commands. Cluster VLAN inside the trunk VLANs
 #                   on the same bridge is refused.
+# v3.4  02-11-2026  ifgroup advice (print_port_info): -mode singlemode instead of
+#                   multimode_lacp (a Linux bridge has no LACP partner and does
+#                   not forward LACPDUs, so an LACP ifgroup never comes up in
+#                   the simulator). The advice first moves the LIFs that the
+#                   cluster setup puts on the ifgroup ports (node-mgmt on
+#                   NODE_MGMT_PORT=e0c, cluster_mgmt on CLUSTER_MGMT_PORT=e0d
+#                   of node 1): ONTAP does not add a port that hosts LIFs to an
+#                   ifgroup. Ports leave the broadcast domain before add-port,
+#                   the ifgroup joins it afterwards. Not yet verified on a sim.
 # =============================================================================
 #
 # DESCRIPTION
@@ -239,7 +248,7 @@ set -euo pipefail
 
 # Single source of truth for the script version. Update together with the
 # VERSION HISTORY above, README and CHANGELOG.
-SCRIPT_VERSION="3.3"
+SCRIPT_VERSION="3.4"
 
 # Default config file location
 CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
@@ -1326,6 +1335,104 @@ validate_num_ports() {
 }
 
 # Print ONTAP port-mapping en ifgroup-commando's voor na de cluster-setup.
+# Ports on which the ONTAP cluster setup of this lab puts the management LIFs:
+# node-mgmt on every node, cluster_mgmt on node 1 (inrichting §1, cluster setup).
+NODE_MGMT_PORT="${NODE_MGMT_PORT:-e0c}"
+CLUSTER_MGMT_PORT="${CLUSTER_MGMT_PORT:-e0d}"
+
+# ifgroup advice after the cluster setup (printed, never executed).
+# - singlemode: a Proxmox Linux bridge has no LACP partner and does not forward
+#   LACPDUs (01:80:c2:00:00:02; the kernel does not allow that bit in group_fwd_mask), so multimode_lacp never
+#   comes up. Static multimode would put one MAC on several tap ports of the same
+#   bridge (MAC flapping) and adds no bandwidth on a virtual e1000, so singlemode
+#   is the safe choice. Not yet verified on a simulator: check at the next setup.
+# - ONTAP does not add a port that hosts LIFs to an ifgroup, so the LIFs that the
+#   cluster setup put on those ports are moved first; the port leaves the
+#   broadcast domain before add-port and the ifgroup joins it afterwards.
+print_ifgrp_advice() {
+  local a0a_ports="$1" a0b_ports="$2" grp ports p
+  local has_node_mgmt=0 has_cluster_mgmt=0
+  for p in $a0a_ports $a0b_ports; do
+    [[ "$p" == "$NODE_MGMT_PORT" ]] && has_node_mgmt=1
+    [[ "$p" == "$CLUSTER_MGMT_PORT" ]] && has_cluster_mgmt=1
+  done
+  echo ""
+  echo "ONTAP ifgroup-advies (na de cluster setup; NIET getest op de simulator, controleren bij de eerstvolgende inrichting):"
+  echo "  # -mode singlemode, niet multimode_lacp: een Linux-bridge in Proxmox heeft geen LACP-partner en stuurt"
+  echo "  # LACPDU's niet door, dus een LACP-ifgroup komt niet up. Statisch multimode zet één MAC op meerdere"
+  echo "  # tap-poorten van dezelfde bridge (MAC flapping) en geeft op een virtuele NIC geen extra bandbreedte."
+  if (( has_node_mgmt || has_cluster_mgmt )); then
+    echo "  # Na de cluster setup staan de node-mgmt-LIF op $NODE_MGMT_PORT (elke node) en de cluster_mgmt-LIF op"
+    echo "  # $CLUSTER_MGMT_PORT (node 1). ONTAP voegt geen poort met LIF's toe aan een ifgroup: verplaats ze eerst."
+    echo "  # Doe dit vanaf de console van de VM (Proxmox > Console), niet via ssh op een van deze LIF's."
+    echo "  # Controle per poort vóór add-port (moet leeg zijn):"
+    echo "  #   network interface show -curr-node <node> -curr-port <poort>"
+  fi
+  for grp in a0a a0b; do
+    if [[ "$grp" == a0a ]]; then ports="$a0a_ports"; else ports="$a0b_ports"; fi
+    [[ -z "${ports// /}" ]] && continue
+    local free="" lifp=""
+    for p in $ports; do
+      if [[ "$p" == "$NODE_MGMT_PORT" || "$p" == "$CLUSTER_MGMT_PORT" ]]; then lifp+=" $p"; else free+=" $p"; fi
+    done
+    echo ""
+    echo "  # ifgroup $grp ($(tr -s ' ' <<< "$ports" | sed 's/^ //')):"
+    if [[ -z "$lifp" ]]; then
+      echo "  # (maak $grp vóór de data-LIF's; staat er al een LIF op een van deze poorten, verplaats die eerst)"
+      for p in $ports; do echo "  network port broadcast-domain remove-ports -ipspace Default -broadcast-domain Default -ports <node>:$p"; done
+      echo "  network port ifgrp create -node <node> -ifgrp $grp -distr-func port -mode singlemode"
+      for p in $ports; do echo "  network port ifgrp add-port -node <node> -ifgrp $grp -port $p"; done
+      echo "  network port broadcast-domain add-ports -ipspace Default -broadcast-domain Default -ports <node>:$grp"
+      continue
+    fi
+    local first="" rest="" n=1
+    if [[ " $lifp " == *" $CLUSTER_MGMT_PORT "* && " $lifp " == *" $NODE_MGMT_PORT "* && -z "${free// /}" ]]; then
+      # Both members host LIFs on node 1: park cluster_mgmt on node 2 first, so that
+      # CLUSTER_MGMT_PORT is free on both nodes and becomes the first member.
+      echo "  # Stap 1 (eenmalig): cluster_mgmt tijdelijk naar node 2, dan is $CLUSTER_MGMT_PORT op beide nodes vrij"
+      echo "  network interface modify -vserver <cluster> -lif cluster_mgmt -home-node <node2> -home-port $NODE_MGMT_PORT"
+      echo "  network interface revert -vserver <cluster> -lif cluster_mgmt"
+      first="$CLUSTER_MGMT_PORT"; rest="$NODE_MGMT_PORT"; n=2
+    else
+      first="$(awk '{print $1}' <<< "$free")"
+      rest="$lifp $(cut -s -d' ' -f2- <<< "${free# }")"
+      if [[ -z "$first" ]]; then
+        echo "  # Alle poorten van $grp dragen LIF's: verplaats die eerst naar een poort buiten $grp, dan zoals hieronder"
+        first="$(awk '{print $1}' <<< "$lifp")"; rest="$(cut -s -d' ' -f2- <<< "${lifp# }")"
+      fi
+    fi
+    echo "  # Stap $n (per node): $grp maken met $first"; n=$((n+1))
+    echo "  network port broadcast-domain remove-ports -ipspace Default -broadcast-domain Default -ports <node>:$first"
+    echo "  network port ifgrp create -node <node> -ifgrp $grp -distr-func port -mode singlemode"
+    echo "  network port ifgrp add-port -node <node> -ifgrp $grp -port $first"
+    echo "  network port broadcast-domain add-ports -ipspace Default -broadcast-domain Default -ports <node>:$grp"
+    echo "  network port show -node <node> -port $grp          # wacht tot link up"
+    local stap=$n
+    if [[ "$first" == "$CLUSTER_MGMT_PORT" && "$rest" == "$NODE_MGMT_PORT" ]]; then
+      echo "  # Stap $n (eenmalig, na stap $((n-1)) op beide nodes): cluster_mgmt terug naar node 1, nu op $grp"
+      echo "  network interface modify -vserver <cluster> -lif cluster_mgmt -home-node <node1> -home-port $grp"
+      echo "  network interface revert -vserver <cluster> -lif cluster_mgmt"
+      stap=$((n+1))
+    fi
+    for p in $rest; do
+      [[ -z "$p" ]] && continue
+      if [[ "$p" == "$NODE_MGMT_PORT" ]]; then
+        echo "  # Stap $stap (per node): node-mgmt-LIF van $p naar $grp, daarna $p erbij"
+        echo "  network interface modify -vserver <cluster> -lif <node-mgmt-LIF van node> -home-port $grp"
+        echo "  network interface revert -vserver <cluster> -lif <node-mgmt-LIF van node>"
+      elif [[ "$p" == "$CLUSTER_MGMT_PORT" ]]; then
+        echo "  # Stap $stap (node 1): cluster_mgmt van $p naar $grp, daarna $p erbij"
+        echo "  network interface modify -vserver <cluster> -lif cluster_mgmt -home-node <node1> -home-port $grp"
+        echo "  network interface revert -vserver <cluster> -lif cluster_mgmt"
+      fi
+      echo "  network interface show -curr-node <node> -curr-port $p    # moet leeg zijn"
+      echo "  network port broadcast-domain remove-ports -ipspace Default -broadcast-domain Default -ports <node>:$p"
+      echo "  network port ifgrp add-port -node <node> -ifgrp $grp -port $p"
+    done
+  done
+  echo ""
+}
+
 print_port_info() {
   local letters="abcdefghijklmnopqrstuvwxyz"
   local p role label
@@ -1350,20 +1457,7 @@ print_port_info() {
     echo "  (TRUNK_PORT=$TRUNK_PORT valt buiten de $NUM_NET_PORTS poorten: geen trunkpoort)"
   fi
 
-  echo ""
-  echo "ONTAP ifgroup-commando's (uitvoeren per node na cluster-init):"
-  if (( ${#a0a[@]} )); then
-    echo "  # CIFS ifgroup a0a:"
-    echo "  network port ifgrp create -node <node> -ifgrp a0a -distr-func port -mode multimode_lacp"
-    for p in "${a0a[@]}"; do echo "  network port ifgrp add-port -node <node> -ifgrp a0a -port $p"; done
-    echo ""
-  fi
-  if (( ${#a0b[@]} )); then
-    echo "  # NFS ifgroup a0b:"
-    echo "  network port ifgrp create -node <node> -ifgrp a0b -distr-func port -mode multimode_lacp"
-    for p in "${a0b[@]}"; do echo "  network port ifgrp add-port -node <node> -ifgrp a0b -port $p"; done
-    echo ""
-  fi
+  print_ifgrp_advice "${a0a[*]:-}" "${a0b[*]:-}"
   echo "  # iSCSI poorten (individueel, geen ifgroup):"
   for p in "${iscsi[@]}"; do echo "  #   $p"; done
   if [[ -n "$TRUNK_PORT" ]] && (( TRUNK_PORT < NUM_NET_PORTS )); then

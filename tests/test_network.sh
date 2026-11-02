@@ -101,6 +101,23 @@ done
 grep -q "e0f.*trunk (VLAN-poorten).*vmbr1 trunks 100;101;102" <<< "$out" && ok "port table shows e0f as trunk" || bad "port table e0f" "$out"
 grep -q "ifgrp a0b -port e0f" <<< "$out" && bad "e0f must not be in ifgroup a0b" "$out" || ok "e0f not in ifgroup a0b"
 
+echo "== ifgroup advice (v3.4)"
+out="$(run --config "$(mkconf 1)" --show-ports)"
+! grep -q "multimode_lacp" <<< "$(grep -v '^  #' <<< "$out")" && grep -q "ifgrp create -node <node> -ifgrp a0a -distr-func port -mode singlemode" <<< "$out" \
+  && ok "advice uses singlemode, no multimode_lacp command" || bad "advice mode" "$out"
+adv="$(sed -n '/ifgroup a0a (e0c e0d)/,/ifgroup a0b/p' <<< "$out")"
+ln() { grep -nF -- "$1" <<< "$adv" | head -1 | cut -d: -f1; }
+l_park=$(ln "-lif cluster_mgmt -home-node <node2> -home-port e0c"); l_add_d=$(ln "-ifgrp a0a -port e0d")
+l_back=$(ln "-lif cluster_mgmt -home-node <node1> -home-port a0a"); l_nm=$(ln "-lif <node-mgmt-LIF van node> -home-port a0a")
+l_add_c=$(ln "-ifgrp a0a -port e0c"); l_bd_d=$(ln "-ports <node>:e0d")
+if [[ -n "$l_park" && -n "$l_add_d" && -n "$l_back" && -n "$l_nm" && -n "$l_add_c" && -n "$l_bd_d" ]] \
+   && (( l_park < l_bd_d && l_bd_d < l_add_d && l_add_d < l_back && l_back < l_nm && l_nm < l_add_c )); then
+  ok "a0a: LIFs leave e0d/e0c before add-port; cluster_mgmt back to node 1 before node-mgmt moves"
+else bad "a0a order park=$l_park bd=$l_bd_d add_d=$l_add_d back=$l_back nm=$l_nm add_c=$l_add_c" "$adv"; fi
+out2="$(CLUSTER_MGMT_PORT=e0g run --config "$(mkconf 1)" --show-ports)"
+grep -q "cluster_mgmt -home-node <node2>" <<< "$out2" && bad "no parking when cluster_mgmt is not in a0a" "$out2" || ok "no cluster_mgmt parking when CLUSTER_MGMT_PORT is outside the ifgroups"
+grep -q "Stap 1 (per node): a0a maken met e0d" <<< "$out2" && ok "step numbering starts at 1 without parking" || bad "numbering" "$out2"
+
 echo "== --dry-run (stubbed Proxmox)"
 good_fixtures
 for n in 1 2 3; do
