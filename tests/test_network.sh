@@ -161,7 +161,7 @@ expect_fail "range beyond 4094 refused" "cannot be read: '2-5000'" --config "$(m
 good_fixtures; fx pve04 vmbr0 1 "50 abc"
 expect_fail "garbage in bridge-vids refused" "bridge-vids of 'vmbr0' on node pve04 cannot be read" --config "$(mkconf 1)" --dry-run
 
-echo "== --dry-run with existing VMs (VM 100-107 exist since the hand fix of 02-11-2026)"
+echo "== --dry-run with existing VMs (the sim VMs exist again since 02-11-2026)"
 # qemu fixture: vmid, then 8 net specs (as qm config shows them, with MAC)
 qfx() { local v="$1"; shift; local i=0 js="{\"name\":\"lab-cluster-x\"" n
   for n in "$@"; do js+=",\"net$i\":\"$n\""; i=$((i+1)); done
