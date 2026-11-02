@@ -21,7 +21,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **`--dry-run` with existing VMs:** a VMID or cluster name that already exists is a NOTE in `--dry-run` (a real deploy still stops). For each existing VMID the dry-run reads `/cluster/resources` and `/nodes/<node>/qemu/<vmid>/config` and compares every `netN` with the plan (model, bridge, tag, trunks; the MAC address and options such as `firewall=` are ignored): `OK` or `DIFF now … plan …`, plus a VM on another node than planned and extra NICs. Any DIFF = exit 1. This verifies the hand-corrected NICs of the sim VMs (100/101, 102/103, 106/107).
 - `--show-ports` now also prints the `qm set` commands (no node contact).
 - Validation: the cluster VLAN inside `TRUNK_VLANS` on the same bridge is refused; `TRUNK_PORT` on net0/net1 or outside `NUM_NET_PORTS` is refused; bridge names are checked.
-- `tests/test_network.sh`: 43 checks with stubbed `pvesh`/`pvesm`/`qm` (no Proxmox needed), including a regression test for the swapped bridges of VM 100 11 checks for ranges and combinations in `bridge-vids` and 7 for the dry-run against existing VMs.
+- `tests/test_network.sh`: 44 checks with stubbed `pvesh`/`pvesm`/`qm` (no Proxmox needed), including a regression test for the swapped bridges of VM 100 12 checks for ranges and combinations (including the live `vmbr1` value of pve02/pve04 with its duplicate 53) in `bridge-vids` and 7 for the dry-run against existing VMs.
 
 ### Changed
 - **Bridges and VLANs in one block**, with a comment saying which bridge is which network (`vmbr0` = 1 Gb, mgmt/data VLAN 50; `vmbr1` = 10 Gb, interconnect 5N and trunk 100–102), in the script defaults and in the config (same names).

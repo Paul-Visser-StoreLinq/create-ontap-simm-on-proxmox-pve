@@ -143,7 +143,8 @@ vids_ok() { # name vmbr0-vids vmbr1-vids
   done
   ok "$name"
 }
-vids_ok "vmbr1 2-4094 (live pve02), vmbr0 2-4094" "2-4094" "2-4094"
+vids_ok "vmbr1 live pve02/pve04 02-11-2026 (with duplicate 53)" "30 50 99" "10 20 30 40 51 52 53 100 101 102 53"
+vids_ok "vmbr0 and vmbr1 2-4094" "2-4094" "2-4094"
 vids_ok "vmbr1 '10 20 50-53 100-102'" "30 50 99" "10 20 50-53 100-102"
 vids_ok "range boundaries exact: vmbr0 50-50, vmbr1 51-53 100-102" "50-50" "51-53 100-102"
 vids_ok "comma-separated: vmbr0 '30,50,99', vmbr1 '51,52,53,100-102'" "30,50,99" "51,52,53,100-102"
