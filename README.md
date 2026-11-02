@@ -131,7 +131,7 @@ The script aborts at startup if cluster and data use the same bridge **and** the
 
 **Seeing the result before deploying.**
 - `./ontap-sim-2node-proxmox.sh --config <conf> --show-ports` prints the port table and the exact `qm set <vmid> --netN …` commands per node, without changing anything (works on any machine, does not contact the nodes).
-- `./ontap-sim-2node-proxmox.sh --config <conf> --dry-run` (on a Proxmox host) runs all prechecks, including the bridge/VLAN check and the VMID check, and prints the same commands; it creates nothing (not even `WORKDIR`).
+- `./ontap-sim-2node-proxmox.sh --config <conf> --dry-run` (on a Proxmox host) runs all prechecks, including the bridge/VLAN check and the VMID check, and prints the same commands; it creates nothing (not even `WORKDIR`). If the VMIDs already exist, the dry-run does not stop: it compares the NICs of those VMs with the plan (`OK` or `DIFF now … plan …`, MAC addresses ignored) and exits 1 on any difference. A real deploy with an existing VMID still stops.
 
 `--version` shows the script version.
 

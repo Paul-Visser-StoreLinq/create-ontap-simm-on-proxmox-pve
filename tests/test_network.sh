@@ -31,7 +31,11 @@ case "$path" in
     f="$FX/net-$node-$br.json"
     [[ -f "$f" ]] && { cat "$f"; exit 0; }
     echo "no such interface '$br'" >&2; exit 2 ;;
-  /cluster/resources) echo '[]' ;;
+  /cluster/resources) if [[ -f "$FX/resources.json" ]]; then cat "$FX/resources.json"; else echo '[]'; fi ;;
+  /nodes/*/qemu/*/config)
+    v="${path%/config}"; v="${v##*/}"
+    f="$FX/qemu-$v.json"; [[ -f "$f" ]] && { cat "$f"; exit 0; }
+    echo "Configuration file 'qemu-server/$v.conf' does not exist" >&2; exit 2 ;;
   /nodes/*/storage/*/content) echo '[{"volid":"software:iso/vsim-netapp-DOT9.16.1-cm_nodar.ova"}]' ;;
   /nodes/*) echo '{}' ;;
   *) echo '{}' ;;
@@ -49,10 +53,11 @@ export PATH="$TMP/bin:$PATH" FX="$TMP/fx"
 # net fixture: node bridge vlan_aware vids
 fx() { printf '{"type":"bridge","iface":"%s","bridge_vlan_aware":%s,"bridge_vids":"%s"}\n' "$2" "$3" "$4" > "$FX/net-$1-$2.json"; }
 good_fixtures() {
+  local nd
   rm -f "$FX"/net-*.json
-  for n in pve02 pve04; do
-    fx "$n" vmbr0 1 "30 50 99"
-    fx "$n" vmbr1 1 "10 20 30 40 51 52 53 100-102"
+  for nd in pve02 pve04; do
+    fx "$nd" vmbr0 1 "30 50 99"
+    fx "$nd" vmbr1 1 "10 20 30 40 51 52 53 100-102"
   done
 }
 
@@ -155,6 +160,53 @@ good_fixtures; fx pve02 vmbr1 1 "2-5000"
 expect_fail "range beyond 4094 refused" "cannot be read: '2-5000'" --config "$(mkconf 1)" --dry-run
 good_fixtures; fx pve04 vmbr0 1 "50 abc"
 expect_fail "garbage in bridge-vids refused" "bridge-vids of 'vmbr0' on node pve04 cannot be read" --config "$(mkconf 1)" --dry-run
+
+echo "== --dry-run with existing VMs (VM 100-107 exist since the hand fix of 02-11-2026)"
+# qemu fixture: vmid, then 8 net specs (as qm config shows them, with MAC)
+qfx() { local v="$1"; shift; local i=0 js="{\"name\":\"lab-cluster-x\"" n
+  for n in "$@"; do js+=",\"net$i\":\"$n\""; i=$((i+1)); done
+  echo "$js}" > "$FX/qemu-$v.json"; }
+good_vm() { # vmid N
+  local v="$1" n="$2" m
+  m="BC:24:11:00:0$n:"
+  qfx "$v" "e1000=${m}00,bridge=vmbr1,tag=5$n" "e1000=${m}01,bridge=vmbr1,tag=5$n,firewall=0" \
+    "e1000=${m}02,bridge=vmbr0,tag=50" "e1000=${m}03,bridge=vmbr0,tag=50" "e1000=${m}04,bridge=vmbr0,tag=50" \
+    "e1000=${m}05,bridge=vmbr1,trunks=100;101;102" "e1000=${m}06,bridge=vmbr0,tag=50" "e1000=${m}07,bridge=vmbr0,tag=50"; }
+existing() { # N: both VMs of cluster N exist on pve02/pve04 with correct NICs
+  local n="$1" v1 v2
+  v1=$((90+2*n)); v2=$((91+2*n))
+  printf '[{"vmid":%d,"node":"pve02","name":"lab-cluster0%d-01"},{"vmid":%d,"node":"pve04","name":"lab-cluster0%d-02"}]\n' "$v1" "$n" "$v2" "$n" > "$FX/resources.json"
+  good_vm "$v1" "$n"; good_vm "$v2" "$n"; }
+for n in 1 2 3; do
+  good_fixtures; existing "$n"
+  out="$(run --config "$(mkconf $n)" --dry-run)"; rc=$?
+  if [[ $rc -eq 0 ]] && grep -q "already exists: a real deploy stops here" <<< "$out" \
+     && grep -q "All NICs of the existing VMs match the plan" <<< "$out" && ! grep -q "DIFF" <<< "$out"; then
+    ok "existing cluster$n with correct NICs: dry-run passes (MAC and firewall= ignored)"
+  else bad "existing cluster$n rc=$rc" "$out"; fi
+done
+good_fixtures; existing 1
+qfx 92 "e1000=BC:24:11:00:01:00,bridge=vmbr0,tag=51" "e1000=BC:24:11:00:01:01,bridge=vmbr0,tag=51" \
+  "e1000=BC:24:11:00:01:02,bridge=vmbr1,tag=50" "e1000=BC:24:11:00:01:03,bridge=vmbr1,tag=50" "e1000=BC:24:11:00:01:04,bridge=vmbr1,tag=50" \
+  "e1000=BC:24:11:00:01:05,bridge=vmbr1,tag=50" "e1000=BC:24:11:00:01:06,bridge=vmbr1,tag=50" "e1000=BC:24:11:00:01:07,bridge=vmbr1,tag=50"
+out="$(run --config "$(mkconf 1)" --dry-run)"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q "net0: DIFF  now e1000,bridge=vmbr0,tag=51   plan e1000,bridge=vmbr1,tag=51" <<< "$out" \
+   && grep -q "net5: DIFF  now e1000,bridge=vmbr1,tag=50   plan e1000,bridge=vmbr1,trunks=100;101;102" <<< "$out" \
+   && grep -q "existing VM(s) differ from the plan" <<< "$out"; then ok "existing VM with swapped bridges (old VM 100): DIFF and exit 1"
+else bad "existing swapped (rc=$rc)" "$out"; fi
+good_fixtures; existing 2
+printf '[{"vmid":94,"node":"pve04","name":"x"},{"vmid":95,"node":"pve04","name":"y"}]\n' > "$FX/resources.json"
+out="$(run --config "$(mkconf 2)" --dry-run)"; rc=$?
+[[ $rc -ne 0 ]] && grep -q "VM 94 is on node pve04, the plan puts it on pve02" <<< "$out" && ok "existing VM on the wrong node: exit 1" || bad "wrong node (rc=$rc)" "$out"
+good_fixtures; existing 3; good_vm 97 3
+python3 -c 'import json,sys;f=sys.argv[1];d=json.load(open(f));d["net8"]="e1000=BC:24:11:00:03:08,bridge=vmbr0";json.dump(d,open(f,"w"))' "$FX/qemu-97.json"
+out="$(run --config "$(mkconf 3)" --dry-run)"; rc=$?
+[[ $rc -ne 0 ]] && grep -q "net8: DIFF  extra NIC e1000" <<< "$out" && ok "extra NIC on an existing VM: DIFF" || bad "extra NIC (rc=$rc)" "$out"
+good_fixtures; existing 1
+out="$(run --config "$(mkconf 1)" </dev/null)"; rc=$?
+[[ $rc -ne 0 ]] && grep -q "ERROR: VMID1=92 is already in use in the cluster" <<< "$out" && ! grep -q "stub qm must not be called" <<< "$out" \
+  && ok "real deploy with an existing VMID still stops before qm" || bad "deploy existing VMID (rc=$rc)" "$out"
+rm -f "$FX/resources.json" "$FX"/qemu-*.json
 
 echo "== regression VM 100 (02-11-2026): interconnect on vmbr0, data on vmbr1"
 good_fixtures

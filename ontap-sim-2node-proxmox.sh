@@ -247,6 +247,7 @@ CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
 SHOW_PORTS=0
 SHOW_SIM_DISK=0
 DRY_RUN=0
+EXISTING_VMIDS=""   # --dry-run: VMIDs that already exist (their NICs are compared with the plan)
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -285,6 +286,8 @@ Options:
   --dry-run        On a Proxmox host: run all prechecks (API, storage, OVA,
                    bridges and VLANs in bridge-vids on both nodes, VMIDs)
                    and print the exact qm set --netN commands per node;
+                   VMIDs that already exist are not an error here: their
+                   NICs are compared with the plan (DIFF = exit 1);
                    creates nothing
   --show-sim-disk  Extract the OVA on TARGET_NODE1 (or reuse an extracted
                    directory), read the size of the sim disk and print per
@@ -825,8 +828,13 @@ alloc_vmids() {
   fi
   # Check VMID1 cluster-wide (pvesh nextid checks this already, but not for manual assignment)
   if [[ "$(vmid_in_use_cluster "$VMID1")" == "yes" ]]; then
-    echo "ERROR: VMID1=$VMID1 is already in use in the cluster" >&2
-    exit 1
+    if (( DRY_RUN == 1 )); then
+      echo "  NOTE: VMID1=$VMID1 already exists: a real deploy stops here; --dry-run compares its NICs with the plan."
+      EXISTING_VMIDS="$EXISTING_VMIDS $VMID1"
+    else
+      echo "ERROR: VMID1=$VMID1 is already in use in the cluster" >&2
+      exit 1
+    fi
   fi
 
   if [[ "$VMID2" == "auto" ]]; then
@@ -835,8 +843,13 @@ alloc_vmids() {
   fi
   # Check VMID2 cluster-wide
   if [[ "$(vmid_in_use_cluster "$VMID2")" == "yes" ]]; then
-    echo "ERROR: VMID2=$VMID2 is already in use in the cluster" >&2
-    exit 1
+    if (( DRY_RUN == 1 )); then
+      echo "  NOTE: VMID2=$VMID2 already exists: a real deploy stops here; --dry-run compares its NICs with the plan."
+      EXISTING_VMIDS="$EXISTING_VMIDS $VMID2"
+    else
+      echo "ERROR: VMID2=$VMID2 is already in use in the cluster" >&2
+      exit 1
+    fi
   fi
 
   if [[ "$VMID1" == "$VMID2" ]]; then
@@ -860,8 +873,12 @@ alloc_vmids() {
     local n2="${CLUSTER_PREFIX}-cluster${cluster_id}-02"
     if grep -qx "$n1" <<< "$all_names" 2>/dev/null || \
        grep -qx "$n2" <<< "$all_names" 2>/dev/null; then
-      echo "ERROR: CLUSTER_NUM=$CLUSTER_NUM is already in use ($n1 or $n2 already exists)" >&2
-      exit 1
+      if (( DRY_RUN == 1 )); then
+        echo "  NOTE: CLUSTER_NUM=$CLUSTER_NUM is already in use ($n1 or $n2 exists): a real deploy stops here."
+      else
+        echo "ERROR: CLUSTER_NUM=$CLUSTER_NUM is already in use ($n1 or $n2 already exists)" >&2
+        exit 1
+      fi
     fi
   fi
 
@@ -1106,6 +1123,82 @@ print_nic_commands() {
       echo "  qm set $vmid --net$p $(nic_spec_for_port "$p")"
     done
   done
+}
+
+# --dry-run only: compare the NICs of VMIDs that already exist with the plan
+# (model, bridge, tag, trunks per netN; the MAC address and other options such as
+# firewall= are ignored). Reads /cluster/resources and /nodes/<node>/qemu/<vmid>/config.
+# Returns 1 when a VM is on another node than planned or a NIC deviates.
+compare_existing_nics() {
+  local vmid want_node node cfg p plan result failed=0
+  [[ -z "${EXISTING_VMIDS// /}" ]] && return 0
+  echo ""
+  echo "[dry-run] Compare the NICs of existing VMs with the plan:"
+  for vmid in $EXISTING_VMIDS; do
+    if [[ "$vmid" == "$VMID1" ]]; then want_node="$TARGET_NODE1"; else want_node="$TARGET_NODE2"; fi
+    node=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null | VMID="$vmid" python3 -c '
+import json, os, sys
+for vm in json.load(sys.stdin):
+    if str(vm.get("vmid")) == os.environ["VMID"]:
+        print(vm.get("node", "")); break
+' 2>/dev/null)
+    if [[ -z "$node" ]]; then
+      echo "ERROR: VM $vmid: node not found in /cluster/resources" >&2; failed=1; continue
+    fi
+    if [[ "${node,,}" != "${want_node,,}" ]]; then
+      echo "ERROR: VM $vmid is on node $node, the plan puts it on $want_node" >&2; failed=1
+    fi
+    if ! cfg=$(pvesh get "/nodes/${node}/qemu/${vmid}/config" --output-format json 2>&1); then
+      echo "ERROR: VM $vmid: config not readable on $node (pvesh: ${cfg//$'\n'/ })" >&2; failed=1; continue
+    fi
+    plan=""
+    for (( p=0; p<NUM_NET_PORTS; p++ )); do plan+="net$p $(nic_spec_for_port "$p")"$'\n'; done
+    if ! result=$(PLAN="$plan" python3 -c '
+import json, os, sys
+MODELS = {"e1000", "e1000e", "virtio", "vmxnet3", "rtl8139", "i82551", "i82557b", "i82559er", "ne2k_isa", "ne2k_pci", "pcnet"}
+def parse(spec):
+    model, opts = None, {}
+    for tok in spec.split(","):
+        k, _, v = tok.partition("=")
+        if k in MODELS:
+            model = k
+        elif k in ("bridge", "tag", "trunks"):
+            opts[k] = v
+    return model, opts.get("bridge", ""), opts.get("tag", ""), opts.get("trunks", "")
+def show(t):
+    m, b, tag, tr = t
+    return "%s,bridge=%s" % (m, b) + (",tag=%s" % tag if tag else "") + (",trunks=%s" % tr if tr else "")
+cfg = json.load(sys.stdin)
+bad = 0
+for line in os.environ["PLAN"].splitlines():
+    if not line.strip():
+        continue
+    net, spec = line.split(" ", 1)
+    want = parse(spec)
+    have = cfg.get(net)
+    if have is None:
+        print("  %s: DIFF  missing   plan %s" % (net, show(want))); bad = 1; continue
+    got = parse(have)
+    if got == want:
+        print("  %s: OK    %s" % (net, show(got)))
+    else:
+        print("  %s: DIFF  now %s   plan %s" % (net, show(got), show(want))); bad = 1
+extra = sorted(k for k in cfg if k.startswith("net") and k[3:].isdigit() and int(k[3:]) >= len([l for l in os.environ["PLAN"].splitlines() if l.strip()]))
+for k in extra:
+    print("  %s: DIFF  extra NIC %s (not in the plan)" % (k, cfg[k].split(",")[0].split("=")[0])); bad = 1
+print("RESULT %d" % bad)
+' <<< "$cfg" 2>&1); then
+      echo "ERROR: VM $vmid: could not compare the NICs: $result" >&2; failed=1; continue
+    fi
+    echo "  # VM $vmid on $node"
+    grep -v '^RESULT ' <<< "$result" | sed 's/^/  /'
+    [[ "$(tail -1 <<< "$result")" == "RESULT 0" ]] || failed=1
+  done
+  if (( failed )); then
+    echo "ERROR: existing VM(s) differ from the plan (see DIFF above)." >&2
+    return 1
+  fi
+  echo "  All NICs of the existing VMs match the plan."
 }
 
 # bridge -> space-separated VLANs (0 = untagged) that this deploy uses on it
@@ -2090,6 +2183,7 @@ if (( DRY_RUN == 1 )); then
   echo "[dry-run] All prechecks passed. Nothing has been created or changed."
   print_port_info
   print_nic_commands "$VMID1" "$VMID2"
+  compare_existing_nics || exit 1
   exit 0
 fi
 
