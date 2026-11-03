@@ -5,18 +5,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [v3.4] – 2026-11-02
+## [v3.4] – 2026-11-03
 
-### Fixed
-- **ifgroup advice used `-mode multimode_lacp`.** A Proxmox Linux bridge has no LACP partner and never forwards LACPDUs (`01:80:c2:00:00:02`; the kernel does not allow that bit in `group_fwd_mask`), so an LACP ifgroup does not come up in the simulator. The advice now uses `-mode singlemode`. Static `multimode` would put one MAC address on several tap ports of the same bridge (MAC flapping) and adds no bandwidth on a virtual e1000.
-- **ifgroup a0a was advised on ports that host LIFs.** After the cluster setup the node-mgmt LIF is on `e0c` (every node) and `cluster_mgmt` on `e0d` (node 1). ONTAP does not add a port that hosts LIFs to an ifgroup, so the old advice failed at `add-port`. The advice now: parks `cluster_mgmt` on node 2, builds a0a on the free `e0d` (port out of the broadcast domain first, a0a into it afterwards), moves `cluster_mgmt` back to node 1 on a0a, then per node moves the node-mgmt LIF to a0a and only then adds `e0c`. Each `add-port` is preceded by `network interface show -curr-node <node> -curr-port <port>` (must be empty). Do it from the VM console, not over ssh on one of these LIFs.
+### Changed
+- **ifgroup advice follows the real lab layout.** `--show-ports` and `--dry-run` print a0a on `e0g` and a0b on `e0h` (`IFGRP_A0A_PORT`, `IFGRP_A0B_PORT`): one port per ifgroup, `-distr-func ip`, port out of the broadcast domain, no broadcast domain on the ifgroup, no LIFs, no data. The ifgroups are **test objects for scripting only**.
+- The advice says they **stay down in the simulator**: a Proxmox Linux bridge has no LACP partner and never forwards LACPDUs (`01:80:c2:00:00:02`). That is expected, not a fault.
+- The port table marks `e0g`/`e0h` as `+ test a0a`/`+ test a0b`; they no longer appear in the list of individual iSCSI ports.
+
+### Removed
+- The earlier (unreleased) advice that put `e0c`/`e0d` in a0a and moved the node-mgmt and `cluster_mgmt` LIFs, and `NODE_MGMT_PORT`/`CLUSTER_MGMT_PORT`.
+- `singlemode` as the recommended mode. Only a note remains: for an ifgroup that does come up in the simulator, use `-mode singlemode` (not tested).
 
 ### Added
-- `NODE_MGMT_PORT` (default `e0c`) and `CLUSTER_MGMT_PORT` (default `e0d`): where the cluster setup puts the management LIFs; the advice uses them.
-- `tests/test_network.sh`: 48 checks (4 for the ifgroup advice: mode, order of the LIF moves, no parking when `cluster_mgmt` is outside the ifgroups, step numbering).
+- `tests/test_network.sh`: 50 checks (6 for the ifgroup advice: layout e0g/e0h with distr-func ip, one port per ifgroup, the down note, no LIF moves and no e0c/e0d, singlemode only as a note, a cluster port is refused).
 
 ### Notes
-- **Not verified on a simulator.** Check mode and order at the next cluster setup (`network port ifgrp show`, `network port show -port a0a`, LIFs home after `revert`). The StoreLinq setup documents do not use ifgroups.
+- Verified 03-11-2026 on three 2-node simulators: a0a (e0g) and a0b (e0h) exist with one port each, distr-func ip, no broadcast domain, no LIFs, all down.
 
 ---
 
