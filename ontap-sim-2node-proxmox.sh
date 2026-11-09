@@ -110,7 +110,8 @@
 #                   comment per bridge; defaults follow the StoreLinq design:
 #                   DATA_BRIDGE=vmbr0 / DATA_VLAN_TAG=50 (was vmbr1 / 20).
 #                   New trunk port: TRUNK_PORT (default net5 = e0f) on
-#                   TRUNK_BRIDGE (vmbr1) with TRUNK_VLANS ("100;101;102");
+#                   TRUNK_BRIDGE (vmbr1) with TRUNK_VLANS (then "100;101;102",
+#                   since v3.5 "100;101;102;103;104;105;106");
 #                   TRUNK_PORT=none switches it off. One function decides the
 #                   NIC per port (nic_spec_for_port), used by create_vm,
 #                   --show-ports and --dry-run, so plan and deploy cannot differ.
@@ -132,6 +133,10 @@
 #                   e0d (with the mgmt LIFs) in a0a is removed. Note: for an
 #                   ifgroup that does come up in the simulator, use
 #                   -mode singlemode (not tested).
+# v3.5  09-11-2026  Default TRUNK_VLANS is now "100;101;102;103;104;105;106"
+#                   (lab SnapMirror VLANs 103-106 added on e0f). The bridge/VLAN
+#                   precheck therefore needs 103-106 in bridge-vids of vmbr1;
+#                   a config that sets TRUNK_VLANS explicitly keeps its own list.
 # =============================================================================
 #
 # DESCRIPTION
@@ -248,7 +253,7 @@ set -euo pipefail
 
 # Single source of truth for the script version. Update together with the
 # VERSION HISTORY above, README and CHANGELOG.
-SCRIPT_VERSION="3.4"
+SCRIPT_VERSION="3.5"
 
 # Default config file location
 CONFIG_FILE="${CONFIG_FILE:-./ontap-sim-2node-proxmox.conf}"
@@ -372,9 +377,9 @@ TARGET_NODE2="${TARGET_NODE2:-pve02}"
 # Which bridge is which network (StoreLinq design, HLD/LLD §7.2; check on the node
 # with: pvesh get /nodes/<node>/network/<bridge>):
 #   vmbr0 = 1 Gb (nic1), VLAN-aware, bridge-vids incl. 50: lab mgmt + data (VLAN 50)
-#   vmbr1 = 10 Gb (nic0), VLAN-aware, bridge-vids incl. 51/52/53 and 100-102:
+#   vmbr1 = 10 Gb (nic0), VLAN-aware, bridge-vids incl. 51-56 and 100-106:
 #           cluster interconnect per cluster (lab-clusterN -> VLAN 5N, L2 only)
-#           and the lab SnapMirror/klant VLANs 100;101;102 (trunk on e0f)
+#           and the lab SnapMirror/klant VLANs 100;101;102;103;104;105;106 (trunk on e0f)
 # Port -> network (8 ports):
 #   net0, net1           e0a, e0b  cluster interconnect  CLUSTER_BRIDGE / CLUSTER_VLAN_TAG
 #   net2-net4, net6-net7 e0c-e0e, e0g, e0h  mgmt/data   DATA_BRIDGE (CIFS_* for the cifs group)
@@ -391,11 +396,11 @@ DATA_VLAN_TAG="${DATA_VLAN_TAG:-50}"
 CIFS_BRIDGE="${CIFS_BRIDGE:-$DATA_BRIDGE}"
 CIFS_VLAN_TAG="${CIFS_VLAN_TAG:-$DATA_VLAN_TAG}"
 # Trunk port: one Proxmox port (net index) that carries several tagged VLANs
-# (Proxmox "trunks=", no tag). Default net5 = e0f with VLAN 100;101;102 on vmbr1.
+# (Proxmox "trunks=", no tag). Default net5 = e0f with VLAN 100;101;102;103;104;105;106 on vmbr1.
 # TRUNK_PORT=none (or empty in the environment AND config) switches it off.
 TRUNK_PORT="${TRUNK_PORT-5}"
 TRUNK_BRIDGE="${TRUNK_BRIDGE:-vmbr1}"
-TRUNK_VLANS="${TRUNK_VLANS:-100;101;102}"
+TRUNK_VLANS="${TRUNK_VLANS:-100;101;102;103;104;105;106}"
 # 1 (default) = before anything is created, check on both nodes that every bridge
 # exists, is VLAN-aware and has every VLAN used in its bridge-vids; 0 = skip.
 CHECK_BRIDGE_VLANS="${CHECK_BRIDGE_VLANS:-1}"
@@ -479,7 +484,7 @@ validate_network_config() {
     exit 1
   fi
   if ! [[ "$TRUNK_VLANS" =~ ^[0-9]+(-[0-9]+)?(\;[0-9]+(-[0-9]+)?)*$ ]]; then
-    echo "ERROR: TRUNK_VLANS must be VLAN IDs or ranges separated by ';' (e.g. 100;101;102 or 100-102); value: '$TRUNK_VLANS'" >&2
+    echo "ERROR: TRUNK_VLANS must be VLAN IDs or ranges separated by ';' (e.g. 100;101;102;103;104;105;106 or 100-106); value: '$TRUNK_VLANS'" >&2
     exit 1
   fi
   local v
@@ -496,7 +501,7 @@ validate_network_config() {
   done
 }
 
-# TRUNK_VLANS ("100;101;102" or "100-102") as a space-separated list of VLAN IDs
+# TRUNK_VLANS ("100;101;102;103;104;105;106" or "100-106") as a space-separated list of VLAN IDs
 trunk_vlan_list() {
   local part a b out=()
   local IFS=';'
@@ -1263,7 +1268,7 @@ raw = str(d.get("bridge_vids") or "").strip()
 if not raw:
     print("NOVIDS"); sys.exit(0)
 # bridge-vids: single VLANs and ranges, separated by spaces or commas,
-# e.g. "2-4094", "100-102" or "10 20 50-53 100-102"
+# e.g. "2-4094", "100-106" or "10 20 50-53 100-106"
 have = set()
 for part in raw.replace(",", " ").split():
     lo, sep, hi = part.partition("-")
@@ -1295,13 +1300,13 @@ print(("MISSING %s %s" % (",".join(map(str, missing)), raw)) if missing else ("O
           failed=1 ;;
         BADVIDS*)
           echo "ERROR: bridge-vids of '$bridge' on node $node cannot be read: '${result#BADVIDS }'." >&2
-          echo "  Expected single VLANs and ranges 1-4094, e.g. '2-4094' or '10 20 50-53 100-102'." >&2
+          echo "  Expected single VLANs and ranges 1-4094, e.g. '2-4094' or '10 20 50-53 100-106'." >&2
           failed=1 ;;
         MISSING*)
           read -r _ miss vids <<< "$result"
           echo "ERROR: bridge '$bridge' on node $node does not carry VLAN(s) $miss (bridge-vids: $vids); nothing created." >&2
           echo "  Add them to bridge-vids of $bridge on $node, or fix CLUSTER_/DATA_/CIFS_/TRUNK_* in the config." >&2
-          echo "  Design: vmbr0 = mgmt/data VLAN 50, vmbr1 = interconnect 5N and trunk 100;101;102." >&2
+          echo "  Design: vmbr0 = mgmt/data VLAN 50, vmbr1 = interconnect 5N and trunk 100;101;102;103;104;105;106." >&2
           failed=1 ;;
         *)
           echo "ERROR: unexpected result for $bridge on $node: $result" >&2; failed=1 ;;

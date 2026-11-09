@@ -104,13 +104,13 @@ All bridges and VLANs live in **one block**: the *Network Configuration* section
 | Bridge | Physical | Carries |
 |---|---|---|
 | `vmbr0` | 1 Gb | lab management and data, VLAN 50 |
-| `vmbr1` | 10 Gb | cluster interconnect per cluster (lab-clusterN → VLAN 5N, L2 only) and the trunk VLANs 100;101;102 |
+| `vmbr1` | 10 Gb | cluster interconnect per cluster (lab-clusterN → VLAN 5N, L2 only) and the trunk VLANs 100;101;102;103;104;105;106 |
 
 | Proxmox | ONTAP | Role | Bridge / VLAN |
 |---|---|---|---|
 | net0, net1 | e0a, e0b | cluster interconnect | `CLUSTER_BRIDGE` / `CLUSTER_VLAN_TAG` (vmbr1 / 5N) |
 | net2–net4, net6, net7 | e0c–e0e, e0g, e0h | mgmt/data (cifs, nfs, iscsi groups) | `DATA_BRIDGE` / `DATA_VLAN_TAG` (vmbr0 / 50) |
-| net5 | e0f | trunk | `TRUNK_BRIDGE` / `TRUNK_VLANS` (vmbr1 / 100;101;102) |
+| net5 | e0f | trunk | `TRUNK_BRIDGE` / `TRUNK_VLANS` (vmbr1 / 100;101;102;103;104;105;106) |
 
 | Variable | Default | Description |
 |---|---|---|
@@ -122,12 +122,12 @@ All bridges and VLANs live in **one block**: the *Network Configuration* section
 | `CIFS_VLAN_TAG` | `DATA_VLAN_TAG` | Optional override: VLAN tag for CIFS ports |
 | `TRUNK_PORT` | `5` | Proxmox port (net index) that becomes a trunk; replaces that port in its group. `none` = no trunk port |
 | `TRUNK_BRIDGE` | `vmbr1` | Bridge for the trunk port |
-| `TRUNK_VLANS` | `100;101;102` | VLANs on the trunk port (Proxmox `trunks=`; `;`-separated, ranges like `100-102` allowed) |
+| `TRUNK_VLANS` | `100;101;102;103;104;105;106` | VLANs on the trunk port (Proxmox `trunks=`; `;`-separated, ranges like `100-106` allowed). Was `100;101;102` before v3.5 |
 | `CHECK_BRIDGE_VLANS` | `1` | Check bridges and `bridge-vids` on both nodes before anything is created; `0` skips it (not recommended) |
 
 The script aborts at startup if cluster and data use the same bridge **and** the same VLAN tag (including `0`/`0`), since everything would then share one L2 domain. It also refuses the cluster VLAN inside `TRUNK_VLANS` on the same bridge, and a `TRUNK_PORT` on net0/net1 or outside `NUM_NET_PORTS`.
 
-**Bridge/VLAN precheck.** Before the first VM is created, the script reads `pvesh get /nodes/<node>/network/<bridge>` for both target nodes (Proxmox API, no SSH needed) and stops with a clear message when a bridge is missing, is not VLAN-aware, has no `bridge-vids`, or does not carry a VLAN the deploy needs (for example `vmbr0` without 50, or `vmbr1` without 5N or 100–102). `bridge-vids` may hold single VLANs and ranges, separated by spaces or commas (`2-4094`, `10 20 50-53 100-102`); a value it cannot read (reversed range, VLAN above 4094, text) also stops it. It checks the network **configuration** of the node, not the running bridge (`bridge vlan show`): after changing `/etc/network/interfaces`, apply it first.
+**Bridge/VLAN precheck.** Before the first VM is created, the script reads `pvesh get /nodes/<node>/network/<bridge>` for both target nodes (Proxmox API, no SSH needed) and stops with a clear message when a bridge is missing, is not VLAN-aware, has no `bridge-vids`, or does not carry a VLAN the deploy needs (for example `vmbr0` without 50, or `vmbr1` without 5N or 100–106). `bridge-vids` may hold single VLANs and ranges, separated by spaces or commas (`2-4094`, `10 20 50-53 100-106`); a value it cannot read (reversed range, VLAN above 4094, text) also stops it. It checks the network **configuration** of the node, not the running bridge (`bridge vlan show`): after changing `/etc/network/interfaces`, apply it first.
 
 **Seeing the result before deploying.**
 - `./ontap-sim-2node-proxmox.sh --config <conf> --show-ports` prints the port table and the exact `qm set <vmid> --netN …` commands per node, without changing anything (works on any machine, does not contact the nodes).
@@ -320,6 +320,7 @@ Then follow the standard ONTAP cluster setup wizard on node1 and join node2 via 
 | v3.2.1 | 08-10-2026 | `--show-sim-disk` table shows the equal-per-shelf layout the config can do (e.g. `2 x 12 = 24`, with `(max 25)`), consistent with `auto` |
 | v3.3 | 02-11-2026 | Fix NICs on the wrong bridge; bridges/VLANs in one block with defaults per the design (data `vmbr0`/50); trunk port net5 (`TRUNK_*`); bridge/VLAN precheck against `bridge-vids` on both nodes; `--dry-run`; `--show-ports` prints the `qm set` commands; `tests/test_network.sh` |
 | v3.4 | 03-11-2026 | ifgroup advice: a0a on `e0g`, a0b on `e0h`, one port each, distr-func ip, no broadcast domain, no LIFs (test objects; down in the simulator, no LACP partner); `IFGRP_A0A_PORT`/`IFGRP_A0B_PORT`; verified on three simulators |
+| v3.5 | 09-11-2026 | Default `TRUNK_VLANS` `100;101;102;103;104;105;106` (lab SnapMirror VLANs 103–106 on e0f); the precheck needs 103–106 in `bridge-vids` of `vmbr1`; `--dry-run` shows an existing VM with the old trunks as `net5: DIFF` |
 
 ---
 

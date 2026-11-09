@@ -5,6 +5,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.5] – 2026-11-09
+
+### Changed
+- **Default `TRUNK_VLANS` is now `100;101;102;103;104;105;106`** (was `100;101;102`): four more lab SnapMirror VLANs (103–106) on the trunk port net5 (e0f). The example config sets the same list explicitly.
+- Because the bridge/VLAN precheck checks every trunk VLAN, a deploy now stops before anything is created when `bridge-vids` of `vmbr1` lacks 103–106 (message lists `103,104,105,106`). Add them to the node first, or set `TRUNK_VLANS` explicitly in the config.
+- `--show-ports` prints `network port vlan create` examples for `e0f-100` … `e0f-106`.
+
+### Notes
+- Existing VMs keep their NICs: `qm set` is not run on them. `--dry-run` reports an existing VM deployed with v3.4 as `net5: DIFF  now …trunks=100;101;102   plan …trunks=100;101;102;103;104;105;106`; change net5 by hand (only `trunks=`, MAC and model unchanged).
+- `tests/test_network.sh`: 52 checks (new: live `vmbr1` without 103–106 stops the deploy; an existing VM with the old trunks gives only a net5 DIFF).
+
+---
+
 ## [v3.4] – 2026-11-03
 
 ### Changed

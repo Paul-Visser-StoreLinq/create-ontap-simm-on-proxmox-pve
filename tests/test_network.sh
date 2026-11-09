@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tests/test_network.sh — network mapping and bridge/VLAN precheck (v3.4; ifgroups a0a/a0b as test objects)
+# tests/test_network.sh — network mapping and bridge/VLAN precheck (v3.5; trunk VLANs 100-106; ifgroups a0a/a0b as test objects)
 #
 # Runs on any machine with bash >= 4 and python3 (no Proxmox needed): qm, pvesh
 # and pvesm are replaced by stubs that read fixtures from a temp directory.
@@ -57,7 +57,7 @@ good_fixtures() {
   rm -f "$FX"/net-*.json
   for nd in pve02 pve04; do
     fx "$nd" vmbr0 1 "30 50 99"
-    fx "$nd" vmbr1 1 "10 20 30 40 51 52 53 100-102"
+    fx "$nd" vmbr1 1 "10 20 30 40 51 52 53 100-106"
   done
 }
 
@@ -78,7 +78,7 @@ expect_lines() {
   local n="$1" vmid="$2"
   for p in 0 1; do echo "qm set $vmid --net$p e1000,bridge=vmbr1,tag=5$n"; done
   for p in 2 3 4; do echo "qm set $vmid --net$p e1000,bridge=vmbr0,tag=50"; done
-  echo "qm set $vmid --net5 e1000,bridge=vmbr1,trunks=100;101;102"
+  echo "qm set $vmid --net5 e1000,bridge=vmbr1,trunks=100;101;102;103;104;105;106"
   for p in 6 7; do echo "qm set $vmid --net$p e1000,bridge=vmbr0,tag=50"; done
 }
 
@@ -98,7 +98,7 @@ for n in 1 2 3; do
   [[ $rc -eq 0 ]] || bad "show-ports cluster$n exit $rc" "$out"
   check_commands "show-ports lab-cluster$n: net0/1 vmbr1 tag 5$n, net2-4/6/7 vmbr0 tag 50, net5 vmbr1 trunks" "$out" "$n"
 done
-grep -q "e0f.*trunk (VLAN-poorten).*vmbr1 trunks 100;101;102" <<< "$out" && ok "port table shows e0f as trunk" || bad "port table e0f" "$out"
+grep -q "e0f.*trunk (VLAN-poorten).*vmbr1 trunks 100;101;102;103;104;105;106" <<< "$out" && ok "port table shows e0f as trunk" || bad "port table e0f" "$out"
 grep -q "ifgrp a0b -port e0f" <<< "$out" && bad "e0f must not be in ifgroup a0b" "$out" || ok "e0f not in ifgroup a0b"
 
 echo "== ifgroup advice (v3.4: test objects a0a/a0b, no LIFs)"
@@ -137,10 +137,10 @@ expect_fail() { # name grep-pattern args...
 echo "== precheck stops"
 good_fixtures; fx pve04 vmbr0 1 "30 99"
 expect_fail "vmbr0 without VLAN 50 on pve04" "bridge 'vmbr0' on node pve04 does not carry VLAN\(s\) 50" --config "$(mkconf 1)" --dry-run
-good_fixtures; fx pve02 vmbr1 1 "10 20 30 40 51 53 100-102"
+good_fixtures; fx pve02 vmbr1 1 "10 20 30 40 51 53 100-106"
 expect_fail "vmbr1 without VLAN 52 on pve02 (cluster2)" "bridge 'vmbr1' on node pve02 does not carry VLAN\(s\) 52" --config "$(mkconf 2)" --dry-run
 good_fixtures; fx pve04 vmbr1 1 "51 52 53"
-expect_fail "vmbr1 without trunk VLANs" "does not carry VLAN\(s\) 100,101,102" --config "$(mkconf 3)" --dry-run
+expect_fail "vmbr1 without trunk VLANs" "does not carry VLAN\(s\) 100,101,102,103,104,105,106" --config "$(mkconf 3)" --dry-run
 good_fixtures; fx pve02 vmbr0 0 ""
 expect_fail "vmbr0 not VLAN-aware" "is not VLAN-aware" --config "$(mkconf 1)" --dry-run
 good_fixtures; fx pve02 vmbr0 1 ""
@@ -159,16 +159,18 @@ vids_ok() { # name vmbr0-vids vmbr1-vids
   done
   ok "$name"
 }
-vids_ok "vmbr1 live pve02/pve04 02-11-2026 (with duplicate 53)" "30 50 99" "10 20 30 40 51 52 53 100 101 102 53"
+vids_ok "vmbr1 after the snapmirror rollout (live list + 54-56 + 103-106, duplicate 53)" "30 50 99" "10 20 30 40 51 52 53 100 101 102 53 54 55 56 103 104 105 106"
+good_fixtures; fx pve02 vmbr1 1 "10 20 30 40 51 52 53 100 101 102 53 54 55 56"
+expect_fail "v3.5: live vmbr1 of 09-11-2026 without 103-106 stops the deploy" "bridge 'vmbr1' on node pve02 does not carry VLAN\(s\) 103,104,105,106" --config "$(mkconf 1)" --dry-run
 vids_ok "vmbr0 and vmbr1 2-4094" "2-4094" "2-4094"
-vids_ok "vmbr1 '10 20 50-53 100-102'" "30 50 99" "10 20 50-53 100-102"
-vids_ok "range boundaries exact: vmbr0 50-50, vmbr1 51-53 100-102" "50-50" "51-53 100-102"
-vids_ok "comma-separated: vmbr0 '30,50,99', vmbr1 '51,52,53,100-102'" "30,50,99" "51,52,53,100-102"
+vids_ok "vmbr1 '10 20 50-53 100-106'" "30 50 99" "10 20 50-53 100-106"
+vids_ok "range boundaries exact: vmbr0 50-50, vmbr1 51-53 100-106" "50-50" "51-53 100-106"
+vids_ok "comma-separated: vmbr0 '30,50,99', vmbr1 '51,52,53,100-106'" "30,50,99" "51,52,53,100-106"
 vids_ok "range around the VLAN: vmbr0 2-99, vmbr1 10-200" "2-99" "10-200"
-good_fixtures; fx pve02 vmbr1 1 "10 20 50-52 100-102"
-expect_fail "range 50-52 lacks 53 (cluster3)" "bridge 'vmbr1' on node pve02 does not carry VLAN\(s\) 53 \(bridge-vids: 10 20 50-52 100-102\)" --config "$(mkconf 3)" --dry-run
-good_fixtures; fx pve04 vmbr1 1 "51-53 100-101"
-expect_fail "range 100-101 lacks trunk VLAN 102" "does not carry VLAN\(s\) 102" --config "$(mkconf 1)" --dry-run
+good_fixtures; fx pve02 vmbr1 1 "10 20 50-52 100-106"
+expect_fail "range 50-52 lacks 53 (cluster3)" "bridge 'vmbr1' on node pve02 does not carry VLAN\(s\) 53 \(bridge-vids: 10 20 50-52 100-106\)" --config "$(mkconf 3)" --dry-run
+good_fixtures; fx pve04 vmbr1 1 "51-53 100-105"
+expect_fail "range 100-105 lacks trunk VLAN 106" "does not carry VLAN\(s\) 106" --config "$(mkconf 1)" --dry-run
 good_fixtures; fx pve02 vmbr0 1 "2-49 51-4094"
 expect_fail "VLAN 50 in the gap between two ranges" "bridge 'vmbr0' on node pve02 does not carry VLAN\(s\) 50" --config "$(mkconf 1)" --dry-run
 good_fixtures; fx pve02 vmbr1 1 "102-100"
@@ -188,7 +190,7 @@ good_vm() { # vmid N
   m="BC:24:11:00:0$n:"
   qfx "$v" "e1000=${m}00,bridge=vmbr1,tag=5$n" "e1000=${m}01,bridge=vmbr1,tag=5$n,firewall=0" \
     "e1000=${m}02,bridge=vmbr0,tag=50" "e1000=${m}03,bridge=vmbr0,tag=50" "e1000=${m}04,bridge=vmbr0,tag=50" \
-    "e1000=${m}05,bridge=vmbr1,trunks=100;101;102" "e1000=${m}06,bridge=vmbr0,tag=50" "e1000=${m}07,bridge=vmbr0,tag=50"; }
+    "e1000=${m}05,bridge=vmbr1,trunks=100;101;102;103;104;105;106" "e1000=${m}06,bridge=vmbr0,tag=50" "e1000=${m}07,bridge=vmbr0,tag=50"; }
 existing() { # N: both VMs of cluster N exist on pve02/pve04 with correct NICs
   local n="$1" v1 v2
   v1=$((90+2*n)); v2=$((91+2*n))
@@ -208,9 +210,17 @@ qfx 92 "e1000=BC:24:11:00:01:00,bridge=vmbr0,tag=51" "e1000=BC:24:11:00:01:01,br
   "e1000=BC:24:11:00:01:05,bridge=vmbr1,tag=50" "e1000=BC:24:11:00:01:06,bridge=vmbr1,tag=50" "e1000=BC:24:11:00:01:07,bridge=vmbr1,tag=50"
 out="$(run --config "$(mkconf 1)" --dry-run)"; rc=$?
 if [[ $rc -ne 0 ]] && grep -q "net0: DIFF  now e1000,bridge=vmbr0,tag=51   plan e1000,bridge=vmbr1,tag=51" <<< "$out" \
-   && grep -q "net5: DIFF  now e1000,bridge=vmbr1,tag=50   plan e1000,bridge=vmbr1,trunks=100;101;102" <<< "$out" \
+   && grep -q "net5: DIFF  now e1000,bridge=vmbr1,tag=50   plan e1000,bridge=vmbr1,trunks=100;101;102;103;104;105;106" <<< "$out" \
    && grep -q "existing VM(s) differ from the plan" <<< "$out"; then ok "existing VM with swapped bridges (old VM 100): DIFF and exit 1"
 else bad "existing swapped (rc=$rc)" "$out"; fi
+good_fixtures; existing 1
+qfx 92 "e1000=BC:24:11:00:01:00,bridge=vmbr1,tag=51" "e1000=BC:24:11:00:01:01,bridge=vmbr1,tag=51" \
+  "e1000=BC:24:11:00:01:02,bridge=vmbr0,tag=50" "e1000=BC:24:11:00:01:03,bridge=vmbr0,tag=50" "e1000=BC:24:11:00:01:04,bridge=vmbr0,tag=50" \
+  "e1000=BC:24:11:00:01:05,bridge=vmbr1,trunks=100;101;102" "e1000=BC:24:11:00:01:06,bridge=vmbr0,tag=50" "e1000=BC:24:11:00:01:07,bridge=vmbr0,tag=50"
+out="$(run --config "$(mkconf 1)" --dry-run)"; rc=$?
+if [[ $rc -ne 0 ]] && grep -q "net5: DIFF  now e1000,bridge=vmbr1,trunks=100;101;102   plan e1000,bridge=vmbr1,trunks=100;101;102;103;104;105;106" <<< "$out" \
+   && ! grep -q "net0: DIFF" <<< "$out"; then ok "v3.5: existing VM deployed with v3.4 trunks 100;101;102: only net5 DIFF"
+else bad "old trunks (rc=$rc)" "$out"; fi
 good_fixtures; existing 2
 printf '[{"vmid":94,"node":"pve04","name":"x"},{"vmid":95,"node":"pve04","name":"y"}]\n' > "$FX/resources.json"
 out="$(run --config "$(mkconf 2)" --dry-run)"; rc=$?
@@ -239,8 +249,8 @@ out="$(TRUNK_PORT=1 run --config "$(mkconf 1)" --show-ports)"; [[ $? -ne 0 ]] &&
 out="$(TRUNK_VLANS='100;x' run --config "$(mkconf 1)" --show-ports)"; [[ $? -ne 0 ]] && ok "TRUNK_VLANS syntax checked" || bad "TRUNK_VLANS syntax" "$out"
 out="$(TRUNK_PORT=none run --config "$(mkconf 1)" --show-ports)"
 grep -q "^  qm set 92 --net5 e1000,bridge=vmbr0,tag=50$" <<< "$out" && ok "TRUNK_PORT=none puts net5 back on the data network" || bad "TRUNK_PORT=none" "$out"
-out="$(TRUNK_VLANS='100-102' run --config "$(mkconf 1)" --show-ports)"
-grep -q "^  qm set 92 --net5 e1000,bridge=vmbr1,trunks=100-102$" <<< "$out" && ok "TRUNK_VLANS range accepted" || bad "range" "$out"
+out="$(TRUNK_VLANS='100-106' run --config "$(mkconf 1)" --show-ports)"
+grep -q "^  qm set 92 --net5 e1000,bridge=vmbr1,trunks=100-106$" <<< "$out" && ok "TRUNK_VLANS range accepted" || bad "range" "$out"
 
 echo ""
 echo "== $PASS OK, $FAIL FOUT"
